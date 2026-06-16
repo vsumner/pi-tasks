@@ -1,0 +1,55 @@
+{
+  "name": "pi-tasks",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pi-native session-backed task orchestration built on pi-subagents.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "tasks",
+    "task-tracking",
+    "subagents"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "exports": {
+    ".": "./src/extension/index.ts",
+    "./events": "./src/extension/src/events.ts",
+    "./state": "./src/extension/src/task-state.ts",
+    "./projection": "./src/extension/src/task-projection.ts",
+    "./store": "./src/extension/src/task-store.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/unit/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "files": [
+    "src/**/*.ts",
+    "skills/**/*",
+    "README.md",
+    "AGENTS.md",
+    "package.json"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}

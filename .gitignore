@@ -1,0 +1,4 @@
+node_modules/
+context/
+.pi-task-recon/
+.DS_Store
