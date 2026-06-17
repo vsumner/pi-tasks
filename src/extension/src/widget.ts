@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatDuration, statusIcon, taskStats } from "./format.ts";
+import { formatDuration, statusIcon, statusRank, taskStats } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
 import { readyTasks, type TaskItem } from "./task-state.ts";
 
@@ -21,17 +21,7 @@ const DEFAULT_MAX_VISIBLE = 10;
 const RECENT_COMPLETED_TTL_MS = 30_000;
 
 function taskSort(a: TaskItem, b: TaskItem): number {
-  const rank = (task: TaskItem) => {
-    switch (task.status) {
-      case "in_progress": return 0;
-      case "pending": return 1;
-      case "blocked": return 2;
-      case "failed": return 3;
-      case "completed": return 4;
-      case "cancelled": return 5;
-    }
-  };
-  const byRank = rank(a) - rank(b);
+  const byRank = statusRank(a.status) - statusRank(b.status);
   if (byRank !== 0) return byRank;
   const numeric = Number(a.id) - Number(b.id);
   if (Number.isFinite(numeric) && numeric !== 0) return numeric;

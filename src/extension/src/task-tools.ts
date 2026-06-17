@@ -10,7 +10,7 @@ import {
   TASK_STATUS_UPDATED_EVENT,
   TASK_UPDATED_EVENT,
 } from "./events.ts";
-import { formatTaskLine, textBlock } from "./format.ts";
+import { formatTaskLine, statusRank, textBlock } from "./format.ts";
 import {
   buildTaskPrompt,
   requestSubagentRun,
@@ -181,10 +181,7 @@ function textResult(text: string, details: Record<string, unknown> = {}) {
 function sortedTasks(tasks: TaskItem[], args: TaskListArgs): TaskItem[] {
   const filtered = args.status ? tasks.filter((task) => task.status === args.status) : tasks;
   if (args.sort === "recent") return [...filtered].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  if (args.sort === "status") {
-    const rank = (task: TaskItem) => ["in_progress", "pending", "blocked", "failed", "completed", "cancelled"].indexOf(task.status);
-    return [...filtered].sort((a, b) => rank(a) - rank(b) || Number(a.id) - Number(b.id));
-  }
+  if (args.sort === "status") return [...filtered].sort((a, b) => statusRank(a.status) - statusRank(b.status) || Number(a.id) - Number(b.id));
   return [...filtered].sort((a, b) => Number(a.id) - Number(b.id) || a.id.localeCompare(b.id));
 }
 

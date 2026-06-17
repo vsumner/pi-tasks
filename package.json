@@ -39,11 +39,12 @@
     "skills/**/*",
     "README.md",
     "AGENTS.md",
+    "LICENSE",
     "package.json"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": ">=0.79.4 <0.80.0",
+    "@earendil-works/pi-tui": ">=0.79.4 <0.80.0"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.49"

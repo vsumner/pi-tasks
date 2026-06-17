@@ -9,18 +9,23 @@ function createPi() {
   const eventHandlers = new Map<string, Set<Handler>>();
   const lifecycleHandlers = new Map<string, Handler>();
   const appended: Array<{ type: string; data: Record<string, unknown> }> = [];
+  const branchEntries: Array<{ type: "custom"; customType: string; data: Record<string, unknown>; timestamp: string }> = [];
   const labels: Array<{ id: string; label: string }> = [];
   const emitLifecycle = (event: string, ctx: unknown) => {
     lifecycleHandlers.get(event)?.({}, ctx);
   };
   return {
     appended,
+    branchEntries,
     labels,
     emitLifecycle,
     pi: {
       registerTool() {},
       registerCommand() {},
-      appendEntry(type: string, data: Record<string, unknown>) { appended.push({ type, data }); },
+      appendEntry(type: string, data: Record<string, unknown>) {
+        appended.push({ type, data });
+        branchEntries.push({ type: "custom", customType: type, data, timestamp: new Date().toISOString() });
+      },
       setLabel(id: string, label: string) { labels.push({ id, label }); },
       on(event: string, handler: Handler) { lifecycleHandlers.set(event, handler); },
       events: {
@@ -59,6 +64,33 @@ function asyncRun(taskId: string, asyncId = "async-1"): TaskRunRecord {
     },
   };
 }
+
+test("session lifecycle reconstructs task projection from appended branch entries", () => {
+  taskStore.reset();
+  const { pi, branchEntries, emitLifecycle } = createPi();
+  piTasksExtension(pi as any);
+  const ctx = {
+    cwd: "/repo",
+    hasUI: false,
+    sessionManager: { getSessionId: () => "session-1", getBranch: () => branchEntries },
+    ui: {},
+  };
+  emitLifecycle("session_start", ctx);
+
+  const task = taskStore.createTask("session-1", { title: "Persist", prompt: "Survive reconstruct", cwd: "/repo", metadata: { live: true } });
+  taskStore.updateTask("session-1", task.id, { status: "blocked", owner: "integration" });
+  assert.equal(taskStore.readTask("session-1", task.id)?.status, "blocked");
+
+  taskStore.applyEvents("session-1", []);
+  assert.equal(taskStore.readTask("session-1", task.id), null);
+
+  emitLifecycle("before_agent_start", ctx);
+  const restored = taskStore.readTask("session-1", task.id);
+  assert.equal(restored?.status, "blocked");
+  assert.equal(restored?.owner, "integration");
+  assert.deepEqual(restored?.metadata, { live: true });
+  assert.ok(branchEntries.every((entry) => entry.type === "custom" && entry.customType.startsWith("pi-tasks:")));
+});
 
 test("async-complete updates matching task and preserves output artifact refs", () => {
   taskStore.reset();

@@ -281,7 +281,7 @@ export const taskStore = {
     const nextStatus = normalizeStatus(status, current.status);
     emit(cwd, makeEvent(TASK_STATUS_UPDATED_EVENT, { taskId, status: nextStatus, reason }));
     if (reason?.trim()) {
-      this.recordEvidence(cwd, taskId, makeEvidence("note", reason.trim(), { source: TASK_STATUS_UPDATED_EVENT }));
+      emit(cwd, makeEvent(TASK_EVIDENCE_RECORDED_EVENT, { taskId, evidence: makeEvidence("note", reason.trim(), { source: TASK_STATUS_UPDATED_EVENT }) }));
     }
     return getTaskOrThrow(cwd, taskId);
   },
@@ -292,19 +292,19 @@ export const taskStore = {
   },
 
   clearCompleted(cwd: string): number {
-    const before = this.readAll(cwd).filter((task) => task.status === "completed").length;
+    const before = Array.from(getCwdMap(cwd).values()).filter((task) => task.status === "completed").length;
     emit(cwd, makeEvent(TASK_CLEARED_EVENT, { scope: "completed" }));
     return before;
   },
 
   clearAll(cwd: string): number {
-    const before = this.readAll(cwd).length;
+    const before = getCwdMap(cwd).size;
     emit(cwd, makeEvent(TASK_CLEARED_EVENT, { scope: "all" }));
     return before;
   },
 
   snapshot(cwd: string): number {
-    const tasks = this.readAll(cwd);
+    const tasks = Array.from(getCwdMap(cwd).values()).map(clone).sort(compareTasks);
     emit(cwd, makeEvent(TASK_SNAPSHOT_EVENT, { tasks }));
     return tasks.length;
   },

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
-import { formatTaskLine, taskStats, textBlock } from "./format.ts";
+import { formatTaskLine, statusIcon, taskStats, textBlock } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
 import type { TaskItem, TaskStatus } from "./task-state.ts";
 import {
@@ -43,12 +43,13 @@ class TaskListComponent {
       lines.push(truncateToWidth(`  ${th.fg("muted", taskStats(this.tasks))}`, width));
       lines.push("");
       for (const task of this.tasks) {
-        const icon = task.status === "completed" ? th.fg("success", "✔")
-          : task.status === "in_progress" ? th.fg("accent", "◼")
-          : task.status === "blocked" ? th.fg("warning", "⊘")
-          : task.status === "failed" ? th.fg("error", "✖")
-          : task.status === "cancelled" ? th.fg("dim", "◌")
-          : th.fg("muted", "◻");
+        const rawIcon = statusIcon(task.status);
+        const icon = task.status === "completed" ? th.fg("success", rawIcon)
+          : task.status === "in_progress" ? th.fg("accent", rawIcon)
+          : task.status === "blocked" ? th.fg("warning", rawIcon)
+          : task.status === "failed" ? th.fg("error", rawIcon)
+          : task.status === "cancelled" ? th.fg("dim", rawIcon)
+          : th.fg("muted", rawIcon);
         const line = task.status === "completed"
           ? `  ${icon} ${th.fg("dim", th.strikethrough(formatTaskLine(task)))}`
           : `  ${icon} ${formatTaskLine(task)}`;

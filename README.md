@@ -19,6 +19,8 @@ pi install git:github.com/vsumner/pi-tasks
 
 Make sure `pi-subagents` is also installed and loaded. `TaskRun`, `TaskStatus`, `TaskOutput`, `TaskResume`, `TaskRetry`, `TaskWait`, and `TaskStop` use the `pi-subagents` event bridge.
 
+This package ships raw TypeScript source and is intended to be loaded by Pi's runtime package loader rather than consumed as precompiled JavaScript.
+
 ## Tools
 
 | Tool | Purpose |
@@ -98,10 +100,14 @@ A future `pi-goals` packet can be represented as a task with:
 }
 ```
 
-## Development
+## Verification
+
+Automated proof:
 
 ```bash
 npm install
 npm test
 npm run typecheck
 ```
+
+Manual live-runtime proof was also performed after installing this local package with Pi: task creation/listing, foreground `TaskRun`, async `TaskRun`, `TaskStatus`, `TaskOutput`, and `TaskWait` were exercised through the actual Pi + `pi-subagents` runtime. Treat this as user-reported local smoke proof, not CI coverage.
