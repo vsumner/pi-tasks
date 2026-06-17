@@ -60,6 +60,46 @@ test("taskStore events include a schema version and snapshot compacts current pr
   assert.deepEqual(taskStore.readAll("/repo").map((item) => item.id), [task.id]);
 });
 
+test("getVersion advances on every mutation and is stable across reads", () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+
+  // reset itself bumps; capture a stable baseline after it.
+  const baseline = taskStore.getVersion();
+
+  const beforeCreate = taskStore.getVersion();
+  const task = taskStore.createTask("/repo", { title: "V", prompt: "P" });
+  assert.ok(taskStore.getVersion() > beforeCreate, "createTask bumps version");
+
+  // Reads must NOT bump — this is the contract the widget cache relies on.
+  const afterReads = taskStore.getVersion();
+  taskStore.readTask("/repo", task.id);
+  taskStore.readAll("/repo");
+  taskStore.ready("/repo");
+  assert.equal(taskStore.getVersion(), afterReads, "reads leave version unchanged");
+
+  const beforeUpdate = taskStore.getVersion();
+  taskStore.updateTask("/repo", task.id, { status: "in_progress" });
+  assert.ok(taskStore.getVersion() > beforeUpdate, "updateTask bumps version");
+
+  const beforeStatus = taskStore.getVersion();
+  taskStore.updateStatus("/repo", task.id, "completed", "done");
+  assert.ok(taskStore.getVersion() > beforeStatus, "updateStatus bumps version");
+
+  const beforeDelete = taskStore.getVersion();
+  taskStore.deleteTask("/repo", task.id);
+  assert.ok(taskStore.getVersion() > beforeDelete, "deleteTask bumps version");
+
+  const beforeApply = taskStore.getVersion();
+  taskStore.applyEvents("/repo", []);
+  assert.ok(taskStore.getVersion() > beforeApply, "applyEvents bumps version");
+
+  const beforeReset = taskStore.getVersion();
+  taskStore.reset();
+  assert.ok(taskStore.getVersion() > beforeReset, "reset bumps version");
+  assert.ok(taskStore.getVersion() > baseline, "version is monotonic across the whole sequence");
+});
+
 test("taskStore reconstructs from captured events", () => {
   const events: TaskEvent[] = [];
   taskStore.reset();

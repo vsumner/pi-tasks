@@ -71,6 +71,11 @@ const highWaterIdsByCwd = new Map<string, number>();
 let eventAppender: ((event: TaskEvent) => void) | undefined;
 let appendSuppressionDepth = 0;
 
+// Monotonic generation bumped on every mutation (emit) and full reproject
+// (applyEvents/reset). Used by the widget to skip re-cloning/re-sorting the
+// task array on idle animation frames when canonical state is unchanged.
+let storeVersion = 0;
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -131,6 +136,7 @@ function currentHighWater(cwd: string): number {
 }
 
 function emit(cwd: string, event: TaskEvent): void {
+  storeVersion += 1;
   const scopedEvent = { ...event, scope: cwd };
   appendEvent(scopedEvent);
   updateHighWaterFromEvent(cwd, scopedEvent);
@@ -236,6 +242,12 @@ export const taskStore = {
     highWaterIdsByCwd.clear();
     eventAppender = undefined;
     appendSuppressionDepth = 0;
+    storeVersion += 1;
+  },
+
+  /** Monotonic generation bumped on every task mutation or full reproject. */
+  getVersion(): number {
+    return storeVersion;
   },
 
   withoutAppending<T>(fn: () => T): T {
@@ -256,6 +268,7 @@ export const taskStore = {
     }
     tasksByCwd.set(cwd, projected);
     highWaterIdsByCwd.set(cwd, Math.max(highWater, ...Array.from(projected.keys(), (id) => numericTaskId(id) ?? 0)));
+    storeVersion += 1;
   },
 
   createTask(cwd: string, input: TaskCreateInput): TaskItem {

@@ -8,6 +8,15 @@ export interface TaskWidgetRuntime {
   latestCtx: ExtensionContext | null;
   widgetTimer: ReturnType<typeof setInterval> | null;
   widgetFrame: number;
+  /**
+   * Cache for the sorted readAll projection, keyed by store version. The
+   * 150ms animation timer re-renders every frame; without this cache every
+   * idle tick cloned+sorted the full task array (and recomputed readyTasks /
+   * planWidget) even when canonical state was unchanged. Invalidated
+   * automatically when the store version advances on any mutation.
+   */
+  cachedVersion?: number;
+  cachedTasks?: TaskItem[];
 }
 
 export type Theme = {
@@ -18,6 +27,22 @@ export type Theme = {
 
 const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽"];
 const DEFAULT_MAX_VISIBLE = 10;
+
+/**
+ * Read the sorted task projection for a scope, reusing the cached array when
+ * the store version has not advanced since the last read. The cache lives on
+ * the per-scope widget runtime; renderers in this module never mutate task
+ * objects (they build strings and sort copies), so sharing one cloned array
+ * across a refresh + render + timer tick is safe.
+ */
+function readCachedTasks(store: typeof taskStore, rt: TaskWidgetRuntime, scope: string): TaskItem[] {
+  const version = store.getVersion();
+  if (rt.cachedVersion === version && rt.cachedTasks) return rt.cachedTasks;
+  const tasks = store.readAll(scope);
+  rt.cachedTasks = tasks;
+  rt.cachedVersion = version;
+  return tasks;
+}
 export const RECENT_COMPLETED_TTL_MS = 30_000;
 export const COMPLETED_ONLY_HIDE_MS = 5_000;
 /** Live activity older than this is considered stale and not rendered. */
@@ -259,7 +284,7 @@ export function createTaskWidget(
     if (!ctx.hasUI) return;
 
     const nowMs = Date.now();
-    const tasks = store.readAll(storeKey(ctx));
+    const tasks = readCachedTasks(store, rt, storeKey(ctx));
 
     // Hide the widget when there is nothing worth showing (no tasks, or only
     // stale completed tasks). Canonical task state is left untouched.
@@ -277,7 +302,7 @@ export function createTaskWidget(
           const latest = rt.latestCtx;
           if (!latest?.hasUI) return;
           rt.widgetFrame++;
-          const current = store.readAll(storeKey(latest));
+          const current = readCachedTasks(store, rt, storeKey(latest));
           const currentMs = Date.now();
           // Stale-completed-only (or emptied) state → hide and stop ticking.
           if (!planWidget(current, currentMs)) {
@@ -305,7 +330,7 @@ export function createTaskWidget(
     return (_tui: unknown, theme: Theme) => ({
       render(width: number): string[] {
         const scope = storeKey(ctx);
-        const tasks = store.readAll(scope);
+        const tasks = readCachedTasks(store, rt, scope);
         // Build the per-task activity map for this scope from the ephemeral
         // runtime store so renderTask can show the live tool line.
         const reader = activityFor;
