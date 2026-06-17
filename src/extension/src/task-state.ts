@@ -38,6 +38,104 @@ export interface TaskAcceptanceConfig {
 
 export type TaskAcceptance = false | TaskAcceptanceLevel | TaskAcceptanceConfig;
 
+const ACCEPTANCE_LEVELS: readonly TaskAcceptanceLevel[] = ["auto", "none", "attested", "checked", "verified", "reviewed"];
+
+/** Human-readable shape reference included in validation errors so the model can self-correct in one turn. */
+export const ACCEPTANCE_SCHEMA_HINT =
+  "acceptance may be: false | one of [auto|none|attested|checked|verified|reviewed] | an object " +
+  "{ level?, criteria?: Array<string|{id,must,severity?}>, evidence?: string[], " +
+  "verify?: Array<{id:string, command:string, timeoutMs?, cwd?, env?, allowFailure?}>, " +
+  "review?: false|{agent?,required?,focus?}, stopRules?: string[], reason?: string }";
+
+function isStringArray(value: unknown): boolean {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+/**
+ * Validate the structural shape of an acceptance policy. Returns a list of
+ * human-readable error strings (empty when valid). Catches malformed configs
+ * at create/update time instead of letting them fail opaquely at TaskRun.
+ * Mirrors claude-code 2.1.169 ("validation errors include the schema").
+ *
+ * Note: this validates shape only. The `agent` task field is intentionally NOT
+ * checked against a registry here — pi-subagents exposes no agent-list API to
+ * extensions, and a hard check would wrongly reject valid packaged/project
+ * agents that this package cannot enumerate.
+ */
+export function validateAcceptance(acceptance: unknown): string[] {
+  const errors: string[] = [];
+  if (acceptance === undefined || acceptance === null || acceptance === false) return errors;
+
+  if (typeof acceptance === "string") {
+    if (!ACCEPTANCE_LEVELS.includes(acceptance as TaskAcceptanceLevel)) {
+      errors.push(`level "${acceptance}" is not one of: ${ACCEPTANCE_LEVELS.join(", ")}`);
+    }
+    return errors;
+  }
+
+  if (typeof acceptance !== "object" || Array.isArray(acceptance)) {
+    errors.push(`must be false, a level string, or an object (got ${Array.isArray(acceptance) ? "array" : typeof acceptance})`);
+    return errors;
+  }
+
+  const cfg = acceptance as Record<string, unknown>;
+
+  if (cfg.level !== undefined && (typeof cfg.level !== "string" || !ACCEPTANCE_LEVELS.includes(cfg.level as TaskAcceptanceLevel))) {
+    errors.push(`level must be one of: ${ACCEPTANCE_LEVELS.join(", ")} (got ${JSON.stringify(cfg.level)})`);
+  }
+
+  if (cfg.criteria !== undefined) {
+    if (!Array.isArray(cfg.criteria)) {
+      errors.push(`criteria must be an array (got ${typeof cfg.criteria})`);
+    } else {
+      cfg.criteria.forEach((entry, i) => {
+        if (typeof entry !== "string" && (typeof entry !== "object" || entry === null || Array.isArray(entry))) {
+          errors.push(`criteria[${i}] must be a string or an object (got ${typeof entry})`);
+        }
+      });
+    }
+  }
+
+  if (cfg.evidence !== undefined && !isStringArray(cfg.evidence)) {
+    errors.push("evidence must be an array of strings");
+  }
+
+  if (cfg.verify !== undefined) {
+    if (!Array.isArray(cfg.verify)) {
+      errors.push("verify must be an array of {id, command} objects");
+    } else {
+      cfg.verify.forEach((entry, i) => {
+        if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+          errors.push(`verify[${i}] must be an object with string id and command`);
+          return;
+        }
+        const v = entry as Record<string, unknown>;
+        if (typeof v.id !== "string" || v.id.length === 0) errors.push(`verify[${i}].id must be a non-empty string`);
+        if (typeof v.command !== "string" || v.command.length === 0) errors.push(`verify[${i}].command must be a non-empty string`);
+      });
+    }
+  }
+
+  if (cfg.review !== undefined && cfg.review !== false && (typeof cfg.review !== "object" || Array.isArray(cfg.review))) {
+    errors.push("review must be false or an object");
+  }
+
+  if (cfg.stopRules !== undefined && !isStringArray(cfg.stopRules)) {
+    errors.push("stopRules must be an array of strings");
+  }
+
+  if (cfg.reason !== undefined && typeof cfg.reason !== "string") {
+    errors.push("reason must be a string");
+  }
+
+  return errors;
+}
+
+/** Build a schema-rich error for invalid acceptance configs. */
+export function acceptanceValidationError(errors: string[]): Error {
+  return new Error(`Invalid acceptance policy:\n- ${errors.join("\n- ")}\n\nExpected shape: ${ACCEPTANCE_SCHEMA_HINT}`);
+}
+
 export interface TaskSubagentRef {
   requestId?: string;
   runId?: string;

@@ -260,6 +260,26 @@ test("TaskList hides internal tasks from output while TaskGet still returns them
   assert.match(fetched.content[0].text, /Bookkeeping/);
 });
 
+test("TaskCreate rejects a malformed acceptance config with a schema-rich error", async () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+  const { tools } = createHarness();
+
+  await assert.rejects(
+    () => tools.get("TaskCreate").execute("call-1", { subject: "Bad", description: "x", acceptance: { verify: [{ id: "t1" }] } }, undefined, undefined, createCtx()),
+    (error: Error) => {
+      assert.match(error.message, /Invalid acceptance policy/);
+      assert.match(error.message, /verify\[0\]\.command must be a non-empty string/);
+      // The schema hint must be included so the model can self-correct in one turn.
+      assert.match(error.message, /Expected shape:/);
+      assert.match(error.message, /verify/);
+      return true;
+    },
+  );
+  // The invalid task was never persisted.
+  assert.equal(taskStore.readAll("session-1").length, 0);
+});
+
 test("TaskGet returns details including dependency, evidence, and metadata", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();

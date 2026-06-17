@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TASK_CLEARED_EVENT, TASK_CREATED_EVENT, TASK_EVIDENCE_RECORDED_EVENT, TASK_RUN_FINISHED_EVENT, TASK_RUN_STARTED_EVENT, TASK_SNAPSHOT_EVENT, TASK_STATUS_UPDATED_EVENT, TASK_UPDATED_EVENT } from "../../src/extension/src/events.ts";
-import { createTask, evaluateClaim, filterVisible, isInternal, projectTasksFromEvents, readyTasks, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
+import { createTask, evaluateClaim, filterVisible, isInternal, projectTasksFromEvents, readyTasks, validateAcceptance, ACCEPTANCE_SCHEMA_HINT, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
 
 test("snapshot anchors state so dropped earlier events survive compaction-style replay", () => {
   // Simulate a pre-compaction branch: create 1, 2, 3; advance 1 to in_progress.
@@ -298,4 +298,58 @@ test("filterVisible drops internal tasks but keeps the rest", () => {
   const visible = createTask({ title: "Visible", prompt: "p" }, "1");
   const internal = { ...createTask({ title: "Internal", prompt: "p" }, "2"), metadata: { _internal: true } };
   assert.deepEqual(filterVisible([visible, internal]).map((task) => task.id), ["1"]);
+});
+
+test("validateAcceptance accepts false, undefined, valid level strings, and well-formed configs", () => {
+  assert.deepEqual(validateAcceptance(undefined), []);
+  assert.deepEqual(validateAcceptance(false), []);
+  for (const level of ["auto", "none", "attested", "checked", "verified", "reviewed"] as const) {
+    assert.deepEqual(validateAcceptance(level), [], `level ${level} should be valid`);
+  }
+  assert.deepEqual(validateAcceptance({ level: "verified" }), []);
+  assert.deepEqual(validateAcceptance({ level: "checked", criteria: ["tests pass", { id: "t1", must: "exit 0" }] }), []);
+  assert.deepEqual(validateAcceptance({ evidence: ["log"] }), []);
+  assert.deepEqual(validateAcceptance({ verify: [{ id: "t1", command: "npm test" }] }), []);
+  assert.deepEqual(validateAcceptance({ review: false }), []);
+  assert.deepEqual(validateAcceptance({ review: { agent: "reviewer", required: true } }), []);
+  assert.deepEqual(validateAcceptance({ stopRules: ["all-green"] }), []);
+});
+
+test("validateAcceptance rejects bad level strings", () => {
+  const errors = validateAcceptance("verifid");
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!, /"verifid" is not one of/);
+});
+
+test("validateAcceptance rejects non-object configs", () => {
+  assert.ok(validateAcceptance([]).length > 0, "arrays are rejected");
+  assert.ok(validateAcceptance(42).length > 0, "numbers are rejected");
+});
+
+test("validateAcceptance flags bad level inside a config object", () => {
+  const errors = validateAcceptance({ level: "bogus" });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!, /level must be one of/);
+  assert.match(errors[0]!, /bogus/);
+});
+
+test("validateAcceptance flags malformed verify entries with index-specific messages", () => {
+  const errors = validateAcceptance({ verify: [{ id: "", command: "" }, "not-an-object", { id: "ok" }] });
+  assert.ok(errors.some((e) => /verify\[0\]\.id must be a non-empty string/.test(e)));
+  assert.ok(errors.some((e) => /verify\[0\]\.command must be a non-empty string/.test(e)));
+  assert.ok(errors.some((e) => /verify\[1\] must be an object/.test(e)));
+  assert.ok(errors.some((e) => /verify\[2\]\.command must be a non-empty string/.test(e)));
+});
+
+test("validateAcceptance flags non-array criteria/evidence/stopRules", () => {
+  assert.ok(validateAcceptance({ criteria: "x" }).some((e) => /criteria must be an array/.test(e)));
+  assert.ok(validateAcceptance({ evidence: "x" }).some((e) => /evidence must be an array of strings/.test(e)));
+  assert.ok(validateAcceptance({ stopRules: 3 }).some((e) => /stopRules must be an array of strings/.test(e)));
+  assert.ok(validateAcceptance({ review: "no" }).some((e) => /review must be false or an object/.test(e)));
+  assert.ok(validateAcceptance({ reason: 5 }).some((e) => /reason must be a string/.test(e)));
+});
+
+test("ACCEPTANCE_SCHEMA_HINT documents the full expected shape", () => {
+  assert.match(ACCEPTANCE_SCHEMA_HINT, /auto\|none\|attested/);
+  assert.match(ACCEPTANCE_SCHEMA_HINT, /verify/);
 });

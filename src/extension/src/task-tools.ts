@@ -27,7 +27,7 @@ import {
 } from "./subagents.ts";
 import { taskStore, type TaskUpdateInput } from "./task-store.ts";
 import { taskStoreKey } from "./session-key.ts";
-import { makeEvidence, readyTasks, filterVisible, type TaskAcceptance, type TaskActivity, type TaskActivityHandler, type TaskItem, type TaskRunRecord, type TaskRunStatus, type TaskStatus } from "./task-state.ts";
+import { acceptanceValidationError, makeEvidence, readyTasks, validateAcceptance, filterVisible, type TaskAcceptance, type TaskActivity, type TaskActivityHandler, type TaskItem, type TaskRunRecord, type TaskRunStatus, type TaskStatus } from "./task-state.ts";
 
 function StringEnum<T extends readonly string[]>(values: T, options?: { description?: string; default?: T[number] }): TUnsafe<T[number]> {
   return Type.Unsafe<T[number]>({
@@ -907,6 +907,8 @@ export function registerTaskTools(
     parameters: TaskCreateParams,
     executionMode: "sequential",
     async execute(_id, params: TaskCreateArgs, _signal, _onUpdate, ctx) {
+      const acceptanceErrors = validateAcceptance(params.acceptance);
+      if (acceptanceErrors.length > 0) throw acceptanceValidationError(acceptanceErrors);
       const task = taskStore.createTask(taskStoreKey(ctx), {
         title: params.subject,
         prompt: params.description,
@@ -985,6 +987,8 @@ export function registerTaskTools(
     async execute(_id, params: TaskUpdateArgs, _signal, _onUpdate, ctx) {
       const id = taskId(params);
       if (!id) throw new Error("taskId is required.");
+      const acceptanceErrors = validateAcceptance(params.acceptance);
+      if (acceptanceErrors.length > 0) throw acceptanceValidationError(acceptanceErrors);
       if (params.status === "deleted") {
         taskStore.deleteTask(taskStoreKey(ctx), id);
         onTaskChanged(ctx, TASK_DELETED_EVENT, { taskId: id });
