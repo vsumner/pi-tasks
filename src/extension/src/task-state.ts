@@ -146,16 +146,16 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function clone<T>(value: T): T {
+export function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function stringArray(value: unknown): string[] {
+export function stringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return Array.from(new Set(value.filter((v): v is string => typeof v === "string" && v.length > 0)));
 }
 
-function mergeMetadata(current: Record<string, unknown>, patch: Record<string, unknown> | undefined): Record<string, unknown> {
+export function mergeMetadata(current: Record<string, unknown>, patch: Record<string, unknown> | undefined): Record<string, unknown> {
   if (!patch) return { ...current };
   const next = { ...current };
   for (const [key, value] of Object.entries(patch)) {
@@ -165,7 +165,7 @@ function mergeMetadata(current: Record<string, unknown>, patch: Record<string, u
   return next;
 }
 
-function normalizeStatus(value: unknown, fallback: TaskStatus = "pending"): TaskStatus {
+export function normalizeStatus(value: unknown, fallback: TaskStatus = "pending"): TaskStatus {
   if (
     value === "pending" ||
     value === "in_progress" ||
@@ -179,9 +179,9 @@ function normalizeStatus(value: unknown, fallback: TaskStatus = "pending"): Task
   return fallback;
 }
 
-function normalizeKind(value: unknown): TaskKind {
+export function normalizeKind(value: unknown, fallback: TaskKind = "subagent"): TaskKind {
   if (value === "manual" || value === "subagent" || value === "packet") return value;
-  return "subagent";
+  return fallback;
 }
 
 function normalizeRunStatus(value: unknown, fallback?: TaskRunStatus): TaskRunStatus | undefined {

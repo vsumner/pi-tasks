@@ -16,10 +16,15 @@ import {
 } from "./events.ts";
 import {
   applyTaskEventToMap,
+  clone,
   compareTasks,
   createTask as createTaskState,
   makeEvidence,
+  mergeMetadata,
+  normalizeKind,
+  normalizeStatus,
   readyTasks,
+  stringArray,
   type TaskAcceptance,
   type TaskCreateInput,
   type TaskEvent,
@@ -62,10 +67,6 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
-}
-
 function getCwdMap(cwd: string): Map<string, TaskItem> {
   let map = tasksByCwd.get(cwd);
   if (!map) {
@@ -104,40 +105,6 @@ function getTaskOrThrow(cwd: string, taskId: string): TaskItem {
   const task = getCwdMap(cwd).get(taskId);
   if (!task) throw new Error(`Task #${taskId} not found.`);
   return clone(task);
-}
-
-function stringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return Array.from(new Set(value.filter((v): v is string => typeof v === "string" && v.length > 0)));
-}
-
-function normalizeStatus(status: unknown, fallback: TaskStatus): TaskStatus {
-  if (
-    status === "pending" ||
-    status === "in_progress" ||
-    status === "blocked" ||
-    status === "completed" ||
-    status === "failed" ||
-    status === "cancelled"
-  ) {
-    return status;
-  }
-  return fallback;
-}
-
-function normalizeKind(kind: unknown, fallback: TaskKind): TaskKind {
-  if (kind === "manual" || kind === "subagent" || kind === "packet") return kind;
-  return fallback;
-}
-
-function mergeMetadata(current: Record<string, unknown>, patch: Record<string, unknown> | undefined): Record<string, unknown> {
-  if (!patch) return { ...current };
-  const next = { ...current };
-  for (const [key, value] of Object.entries(patch)) {
-    if (value === null) delete next[key];
-    else next[key] = value;
-  }
-  return next;
 }
 
 function applyUpdate(task: TaskItem, update: TaskUpdateInput): TaskItem {
