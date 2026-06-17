@@ -5,7 +5,7 @@ import { taskStore, type TaskEvent, type TaskRunRecord } from "../../src/extensi
 
 type Handler = (data: unknown) => void;
 
-function createEventBus(options: { parallelResultCount?: number } = {}) {
+function createEventBus(options: { parallelResultCount?: number; statusText?: string } = {}) {
   const handlers = new Map<string, Set<Handler>>();
   const requests: unknown[] = [];
   return {
@@ -28,7 +28,7 @@ function createEventBus(options: { parallelResultCount?: number } = {}) {
         const isResume = request.params?.action === "resume";
         const isStatus = request.params?.action === "status";
         const children = Array.isArray(request.params?.tasks) ? request.params.tasks as Array<Record<string, unknown>> : [];
-        const text = isInterrupt ? "Async run not found" : isResume ? "Resume complete" : isStatus ? "State: complete" : children.length ? "Parallel complete" : "State: complete";
+        const text = isInterrupt ? "Async run not found" : isResume ? "Resume complete" : isStatus ? options.statusText ?? "State: complete" : children.length ? "Parallel complete" : "State: complete";
         const parallelResults = children.map((child, index) => ({ agent: child.agent as string, exitCode: 0, finalOutput: `parallel output ${index + 1}`, savedOutputPath: `/tmp/out-${index + 1}.md` }));
         const limitedParallelResults = typeof options.parallelResultCount === "number" ? parallelResults.slice(0, options.parallelResultCount) : parallelResults;
         const results = children.length
@@ -53,7 +53,7 @@ function createEventBus(options: { parallelResultCount?: number } = {}) {
   };
 }
 
-function createHarness(options: { parallelResultCount?: number } = {}) {
+function createHarness(options: { parallelResultCount?: number; statusText?: string } = {}) {
   const tools = new Map<string, any>();
   const events = createEventBus(options);
   const pi = {
@@ -418,15 +418,45 @@ test("TaskStatus branch summary counts ready tasks from the whole branch when fi
   assert.equal(taskStore.readTask("session-1", ready.id)?.status, "pending");
 });
 
-test("TaskStatus summarizes branch state and refreshes a task lightly", async () => {
+test("TaskStatus pins the current pi-subagents State: complete async status format", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
   taskStore.setEventAppender((event) => events.push(event));
   const id = seedInFlightTask();
-  const { tools } = createHarness();
+  const { tools } = createHarness({ statusText: "State: complete" });
 
   const result = await tools.get("TaskStatus").execute("call-1", { taskId: id }, undefined, undefined, createCtx());
 
   assert.match(result.content[0].text, /#1 \[completed\]/);
   assert.match(result.content[0].text, /refresh: State: complete/);
+  assert.equal(taskStore.readTask("session-1", id)?.status, "completed");
+});
+
+test("TaskStatus warns when async status output lacks a recognizable State line", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const id = seedInFlightTask();
+  const { tools } = createHarness({ statusText: "No structured state here" });
+
+  const result = await tools.get("TaskStatus").execute("call-1", { taskId: id }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /#1 \[in_progress\]/);
+  assert.match(result.content[0].text, /refresh: Unrecognized pi-subagents status format; task remains in_progress/);
+  assert.equal(taskStore.readTask("session-1", id)?.status, "in_progress");
+});
+
+test("TaskWait timeout reports unrecognized async status state", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const id = seedInFlightTask();
+  const { tools } = createHarness({ statusText: "State: done" });
+
+  const result = await tools.get("TaskWait").execute("call-1", { taskId: id, timeout_ms: 1000, poll_ms: 1000 }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Timed out waiting for task #1/);
+  assert.match(result.content[0].text, /Unrecognized pi-subagents status state "done"; task remains in_progress/);
+  assert.equal(result.details.timedOut, true);
+  assert.equal(taskStore.readTask("session-1", id)?.status, "in_progress");
 });

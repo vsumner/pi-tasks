@@ -525,14 +525,17 @@ async function runTasksInParallel(
   }
 }
 
-function terminalStatusFromAsyncSummary(summary: string): TaskRunStatus | undefined {
+const NON_TERMINAL_ASYNC_STATES = new Set(["queued", "running", "detached", "pending", "active", "in_progress"]);
+
+function parseAsyncSummaryStatus(summary: string): { status?: TaskRunStatus; warning?: string } {
   const match = summary.match(/State:\s*([^\s]+)/i);
   const state = match?.[1]?.toLowerCase();
-  if (!state) return undefined;
-  if (state === "complete" || state === "completed") return "completed";
-  if (state === "failed" || state === "error") return "failed";
-  if (state === "cancelled" || state === "canceled" || state === "interrupted") return "cancelled";
-  return undefined;
+  if (!state) return { warning: "Unrecognized pi-subagents status format; task remains in_progress." };
+  if (state === "complete" || state === "completed" || state === "success" || state === "succeeded") return { status: "completed" };
+  if (state === "failed" || state === "failure" || state === "error") return { status: "failed" };
+  if (state === "cancelled" || state === "canceled" || state === "interrupted") return { status: "cancelled" };
+  if (NON_TERMINAL_ASYNC_STATES.has(state)) return {};
+  return { warning: `Unrecognized pi-subagents status state "${state}"; task remains in_progress.` };
 }
 
 async function refreshAsyncStatus(pi: ExtensionAPI, ctx: ExtensionContext, task: TaskItem, signal?: AbortSignal): Promise<string | undefined> {
@@ -542,22 +545,22 @@ async function refreshAsyncStatus(pi: ExtensionAPI, ctx: ExtensionContext, task:
   if (!id) return undefined;
   const response = await requestSubagentRun(pi, ctx, { action: "status", id, cwd: ctx.cwd }, signal);
   const summary = summarizeSubagentResponse(response);
-  const status = terminalStatusFromAsyncSummary(summary);
+  const parsed = parseAsyncSummaryStatus(summary);
   const scope = taskStoreKey(ctx);
   const current = taskStore.readTask(scope, task.id);
-  if (current?.status === "in_progress" && status) {
-    taskStore.finishRun(scope, task.id, status, {
+  if (current?.status === "in_progress" && parsed.status) {
+    taskStore.finishRun(scope, task.id, parsed.status, {
       summary,
       output: summary,
-      error: status === "failed" || status === "cancelled" ? summary : undefined,
+      error: parsed.status === "failed" || parsed.status === "cancelled" ? summary : undefined,
     });
-    taskStore.recordEvidence(scope, task.id, makeEvidence(status === "failed" ? "error" : status === "cancelled" ? "note" : "output", summary, {
+    taskStore.recordEvidence(scope, task.id, makeEvidence(parsed.status === "failed" ? "error" : parsed.status === "cancelled" ? "note" : "output", summary, {
       source: "TaskOutput.refresh",
       asyncId: current.run?.subagent.asyncId,
       runId: current.run?.subagent.runId,
     }));
   }
-  return summary;
+  return parsed.warning ? `${parsed.warning}\n${summary}` : summary;
 }
 
 export type TaskChangeHandler = (ctx: ExtensionContext, eventType: string, data?: Record<string, unknown>) => void;
