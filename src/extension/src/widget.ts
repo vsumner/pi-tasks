@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatDuration, primarySavedOutput, runOutputPaths, statusIcon, taskStats } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
-import { isTaskBlocked, readyTasks, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
+import { filterVisible, isTaskBlocked, readyTasks, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
 
 export interface TaskWidgetRuntime {
   latestCtx: ExtensionContext | null;
@@ -38,7 +38,10 @@ const DEFAULT_MAX_VISIBLE = 10;
 function readCachedTasks(store: typeof taskStore, rt: TaskWidgetRuntime, scope: string): TaskItem[] {
   const version = store.getVersion();
   if (rt.cachedVersion === version && rt.cachedTasks) return rt.cachedTasks;
-  const tasks = store.readAll(scope);
+  // Internal bookkeeping tasks (metadata._internal) never render in the
+  // widget; filtering here keeps the cache visible-only so every consumer
+  // (refresh hide-check, timer, render) shares one filtered array.
+  const tasks = filterVisible(store.readAll(scope));
   rt.cachedTasks = tasks;
   rt.cachedVersion = version;
   return tasks;

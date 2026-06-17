@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TASK_CLEARED_EVENT, TASK_CREATED_EVENT, TASK_EVIDENCE_RECORDED_EVENT, TASK_RUN_FINISHED_EVENT, TASK_RUN_STARTED_EVENT, TASK_SNAPSHOT_EVENT, TASK_STATUS_UPDATED_EVENT, TASK_UPDATED_EVENT } from "../../src/extension/src/events.ts";
-import { createTask, evaluateClaim, projectTasksFromEvents, readyTasks, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
+import { createTask, evaluateClaim, filterVisible, isInternal, projectTasksFromEvents, readyTasks, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
 
 test("snapshot anchors state so dropped earlier events survive compaction-style replay", () => {
   // Simulate a pre-compaction branch: create 1, 2, 3; advance 1 to in_progress.
@@ -285,4 +285,17 @@ test("evaluateClaim force overrides owner_busy but not terminal or blocked", () 
   const forceTerminal = evaluateClaim(terminal, [terminal], { owner: "alice", force: true });
   assert.equal(forceTerminal.success, false);
   assert.equal(forceTerminal.reason, "already_terminal");
+});
+
+test("isInternal reflects the metadata._internal bookkeeping flag", () => {
+  assert.equal(isInternal(createTask({ title: "A", prompt: "p" }, "1")), false);
+  assert.equal(isInternal({ ...createTask({ title: "A", prompt: "p" }, "1"), metadata: { _internal: true } }), true);
+  assert.equal(isInternal({ ...createTask({ title: "A", prompt: "p" }, "1"), metadata: { _internal: 1 } }), true);
+  assert.equal(isInternal({ ...createTask({ title: "A", prompt: "p" }, "1"), metadata: { _internal: false } }), false);
+});
+
+test("filterVisible drops internal tasks but keeps the rest", () => {
+  const visible = createTask({ title: "Visible", prompt: "p" }, "1");
+  const internal = { ...createTask({ title: "Internal", prompt: "p" }, "2"), metadata: { _internal: true } };
+  assert.deepEqual(filterVisible([visible, internal]).map((task) => task.id), ["1"]);
 });

@@ -27,7 +27,7 @@ import {
 } from "./subagents.ts";
 import { taskStore, type TaskUpdateInput } from "./task-store.ts";
 import { taskStoreKey } from "./session-key.ts";
-import { makeEvidence, readyTasks, type TaskAcceptance, type TaskActivity, type TaskActivityHandler, type TaskItem, type TaskRunRecord, type TaskRunStatus, type TaskStatus } from "./task-state.ts";
+import { makeEvidence, readyTasks, filterVisible, type TaskAcceptance, type TaskActivity, type TaskActivityHandler, type TaskItem, type TaskRunRecord, type TaskRunStatus, type TaskStatus } from "./task-state.ts";
 
 function StringEnum<T extends readonly string[]>(values: T, options?: { description?: string; default?: T[number] }): TUnsafe<T[number]> {
   return Type.Unsafe<T[number]>({
@@ -695,7 +695,7 @@ export async function getTaskStatus(
   const scope = taskStoreKey(ctx);
   const id = taskId(params);
   if (!id) {
-    const allTasks = taskStore.readAll(scope);
+    const allTasks = filterVisible(taskStore.readAll(scope));
     const tasks = sortedTasks(allTasks, { status: params.status, sort: "status" });
     const ready = readyTasks(allTasks).length;
     const active = allTasks.filter((task) => task.status === "in_progress").length;
@@ -942,8 +942,12 @@ export function registerTaskTools(
     parameters: TaskListParams,
     async execute(_id, params: TaskListArgs, _signal, _onUpdate, ctx) {
       const scope = taskStoreKey(ctx);
+      // allTasks is the full set (used for accurate blocker resolution in
+      // formatTaskLine); only the listed rows are filtered to visible tasks so
+      // internal bookkeeping tasks never reach the model.
       const allTasks = taskStore.readAll(scope);
-      const tasks = sortedTasks(params.ready_only ? taskStore.ready(scope) : allTasks, params);
+      const source = params.ready_only ? taskStore.ready(scope) : allTasks;
+      const tasks = sortedTasks(filterVisible(source), params);
       if (tasks.length === 0) return textResult(params.ready_only ? "No ready tasks." : "No tasks found.", { tasks });
       return textResult(tasks.map((task) => formatTaskLine(task, allTasks)).join("\n"), { tasks });
     },

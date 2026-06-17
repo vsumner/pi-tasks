@@ -243,6 +243,23 @@ test("TaskList hides completed blockers from blockedBy summaries", async () => {
   assert.deepEqual(result.details.tasks.map((task: { id: string }) => task.id), [blocker.id, target.id]);
 });
 
+test("TaskList hides internal tasks from output while TaskGet still returns them", async () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+  taskStore.createTask("session-1", { title: "Visible", prompt: "Show me", cwd: "/repo" });
+  taskStore.createTask("session-1", { title: "Bookkeeping", prompt: "Internal", metadata: { _internal: true }, cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskList").execute("call-1", {}, undefined, undefined, createCtx());
+  assert.match(result.content[0].text, /#1 \[pending\] Visible/);
+  assert.doesNotMatch(result.content[0].text, /Bookkeeping/);
+  assert.deepEqual(result.details.tasks.map((task: { id: string }) => task.id), ["1"]);
+
+  // TaskGet (explicit by-id lookup) still returns internal tasks.
+  const fetched = await tools.get("TaskGet").execute("call-2", { taskId: "2" }, undefined, undefined, createCtx());
+  assert.match(fetched.content[0].text, /Bookkeeping/);
+});
+
 test("TaskGet returns details including dependency, evidence, and metadata", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
@@ -641,6 +658,19 @@ test("TaskStatus branch summary counts ready tasks from the whole branch when fi
   assert.match(result.content[0].text, /#2 \[completed\]/);
   assert.doesNotMatch(result.content[0].text, /#1 \[pending\]/);
   assert.equal(taskStore.readTask("session-1", ready.id)?.status, "pending");
+});
+
+test("TaskStatus list summary excludes internal tasks from counts and rows", async () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+  taskStore.createTask("session-1", { title: "Visible", prompt: "Show me", cwd: "/repo" });
+  taskStore.createTask("session-1", { title: "Internal", prompt: "Hidden", metadata: { _internal: true }, cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskStatus").execute("call-1", {}, undefined, undefined, createCtx());
+  assert.match(result.content[0].text, /1 task:/);
+  assert.match(result.content[0].text, /#1 \[pending\] Visible/);
+  assert.doesNotMatch(result.content[0].text, /Internal/);
 });
 
 test("TaskStatus pins the current pi-subagents State: complete async status format", async () => {

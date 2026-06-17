@@ -265,6 +265,22 @@ export function compareTasks(a: TaskItem, b: TaskItem): number {
   return a.id.localeCompare(b.id);
 }
 
+/**
+ * True for bookkeeping tasks hidden from model-facing list/status output and
+ * the task widget. Set via `metadata._internal` (truthy) when an extension or
+ * pi-goals creates scaffolding work the model and user should not see. Mirrors
+ * claude-code's `metadata._internal` filter in TaskListTool/useTasksV2.
+ * Canonical state is unaffected — TaskGet/TaskRun still see internal tasks by id.
+ */
+export function isInternal(task: TaskItem): boolean {
+  return Boolean(task.metadata?._internal);
+}
+
+/** Tasks visible to the model in list/status output and the widget. */
+export function filterVisible(tasks: Iterable<TaskItem>): TaskItem[] {
+  return Array.from(tasks).filter((task) => !isInternal(task));
+}
+
 function applyPatch(task: TaskItem, patch: TaskPatch, ts: string): TaskItem {
   const next = clone(task);
   if (typeof patch.title === "string") next.title = patch.title.trim();
