@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatDuration, primarySavedOutput, runOutputPaths, statusIcon, taskStats } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
-import { filterVisible, indexById, isTaskBlocked, readyTasks, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
+import { filterVisible, indexById, isTaskBlocked, readyTasksWithIndex, unresolvedBlockersById, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
 
 export interface TaskWidgetRuntime {
   latestCtx: ExtensionContext | null;
@@ -123,7 +123,7 @@ function renderTask(task: TaskItem, statusById: Map<string, TaskItem>, theme: Th
       ? theme.fg("accent", `${task.activeForm ?? task.title}…`)
       : task.title;
 
-  const openBlockers = task.blockedBy.filter((id) => statusById.get(id)?.status !== "completed");
+  const openBlockers = unresolvedBlockersById(task, statusById);
   const blocked = openBlockers.length > 0
     ? theme.fg("dim", ` › blocked by ${openBlockers.map((id) => `#${id}`).join(", ")}`)
     : "";
@@ -230,12 +230,14 @@ export function renderLines(tasks: TaskItem[], theme: Theme, frame: number, widt
   if (!plan) return [];
   const maxW = Math.max(1, width);
   const nowMs = Date.now();
-  const ready = readyTasks(tasks);
+  // Build the status index once per frame and reuse it for both readiness
+  // (readyTasksWithIndex) and per-row blocker rendering (unresolvedBlockersById)
+  // — previously readiness rebuilt the full id index once per candidate task on
+  // every 150ms repaint tick.
+  const statusById = indexById(tasks);
+  const ready = readyTasksWithIndex(tasks, statusById);
   const readyCount = ready.length;
   const failedCount = tasks.filter((task) => task.status === "failed").length;
-  // Build the status index once per frame instead of a fresh O(n) all.find()
-  // scan per blocker per task on every 150ms repaint tick.
-  const statusById = indexById(tasks);
   const headerBits = [taskStats(tasks)];
   if (readyCount) headerBits.push(`${readyCount} ready`);
   if (failedCount) headerBits.push(`${failedCount} failed`);

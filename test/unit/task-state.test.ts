@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TASK_CLEARED_EVENT, TASK_CREATED_EVENT, TASK_EVIDENCE_RECORDED_EVENT, TASK_RUN_FINISHED_EVENT, TASK_RUN_STARTED_EVENT, TASK_SNAPSHOT_EVENT, TASK_STATUS_UPDATED_EVENT, TASK_UPDATED_EVENT } from "../../src/extension/src/events.ts";
-import { createTask, evaluateClaim, filterVisible, isInternal, projectTasksFromEvents, readyTasks, validateAcceptance, ACCEPTANCE_SCHEMA_HINT, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
+import { createTask, evaluateClaim, filterVisible, indexById, isInternal, isTaskBlocked, isTaskBlockedById, projectTasksFromEvents, readyTasks, readyTasksWithIndex, unresolvedBlockers, unresolvedBlockersById, validateAcceptance, ACCEPTANCE_SCHEMA_HINT, type TaskItem, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
 
 test("snapshot anchors state so dropped earlier events survive compaction-style replay", () => {
   // Simulate a pre-compaction branch: create 1, 2, 3; advance 1 to in_progress.
@@ -352,4 +352,50 @@ test("validateAcceptance flags non-array criteria/evidence/stopRules", () => {
 test("ACCEPTANCE_SCHEMA_HINT documents the full expected shape", () => {
   assert.match(ACCEPTANCE_SCHEMA_HINT, /auto\|none\|attested/);
   assert.match(ACCEPTANCE_SCHEMA_HINT, /verify/);
+});
+
+test("indexed readiness helpers are equivalent to the list variants across a dependency graph", () => {
+  // Graph: 1 (done) <- 2 <- 3 , plus independent 4, and 5 blocked by a missing dep.
+  const t1 = createTask({ title: "Setup", prompt: "x" }, "1");
+  const t2 = createTask({ title: "Build", prompt: "x", blockedBy: ["1"] }, "2");
+  const t3 = createTask({ title: "Ship", prompt: "x", blockedBy: ["2"] }, "3");
+  const t4 = createTask({ title: "Docs", prompt: "x" }, "4");
+  const t5 = createTask({ title: "Ghost dep", prompt: "x", blockedBy: ["999"] }, "5");
+  t1.status = "completed";
+  const tasks: TaskItem[] = [t1, t2, t3, t4, t5];
+  const byId = indexById(tasks);
+
+  // readyTasks (rebuilds index internally) must match readyTasksWithIndex (reuses).
+  assert.deepEqual(
+    readyTasks(tasks).map((t) => t.id),
+    readyTasksWithIndex(tasks, byId).map((t) => t.id),
+  );
+  // With #1 completed, #2 is ready; #3 still waits on #2; #4 free; #5 ghost-blocked.
+  assert.deepEqual(readyTasksWithIndex(tasks, byId).map((t) => t.id), ["2", "4"]);
+
+  // Per-task equivalence between the single-shot and indexed blocked checks.
+  for (const task of tasks) {
+    assert.equal(isTaskBlockedById(task, byId), isTaskBlocked(task, tasks), `blocked mismatch for #${task.id}`);
+    assert.deepEqual(unresolvedBlockersById(task, byId), unresolvedBlockers(task, tasks), `unresolved mismatch for #${task.id}`);
+  }
+});
+
+test("readyTasksWithIndex reuses the passed index instead of rebuilding it (the O(n) fix)", () => {
+  // Prove the indexed helpers honor the map they are handed rather than
+  // rebuilding it internally: a hand-built map that claims the dependency is
+  // completed, while the live array still holds a pending copy. If the helper
+  // rebuilt the index it would see pending and block the child; honoring the
+  // passed map unblocks it. This is the structural guard against the prior
+  // O(n^2) per-task reindex regression.
+  const depDone = createTask({ title: "Dep", prompt: "x" }, "1");
+  depDone.status = "completed";
+  const depPending = createTask({ title: "Dep", prompt: "x" }, "1");
+  const child = createTask({ title: "Child", prompt: "x", blockedBy: ["1"] }, "2");
+  const divergent = new Map([["1", depDone], ["2", child]]);
+
+  // Honoring the passed (divergent) map: dep looks completed, so child is ready.
+  assert.equal(isTaskBlockedById(child, divergent), false);
+  assert.equal(unresolvedBlockersById(child, divergent).length, 0);
+  // A freshly built index from the pending array blocks the child as expected.
+  assert.equal(isTaskBlockedById(child, indexById([depPending, child])), true);
 });

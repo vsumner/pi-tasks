@@ -36,6 +36,7 @@ import { taskStoreKey } from "./session-key.ts";
 import {
   indexById,
   isTerminalStatus,
+  isTaskBlocked,
   makeEvidence,
   readyTasks,
   filterVisible,
@@ -58,6 +59,13 @@ import {
   textResult,
   sortedTasks,
 } from "./task-schemas.ts";
+
+/** Update the pi-tasks status line, swallowing errors when the UI is stale
+ *  during session replacement (hot reload, /fork, /tree). Centralizes the
+ *  repeated `try { ctx.ui.setStatus(...) } catch {}` noise. */
+function safeSetStatus(ctx: ExtensionContext, text: string | undefined): void {
+  try { ctx.ui.setStatus("pi-tasks", text); } catch { /* UI may be stale during session replacement */ }
+}
 
 function taskIdsToRun(args: TaskRunArgs, ctx: ExtensionContext): string[] {
   const ids = args.task_ids ?? (taskId(args) ? [taskId(args)!] : undefined);
@@ -113,8 +121,10 @@ function makeResumeRun(task: TaskItem, agent: string): TaskRunRecord {
 function canRun(task: TaskItem, all: TaskItem[], force: boolean | undefined): string | undefined {
   if (force) return undefined;
   if (task.status !== "pending") return `not pending (status: ${task.status})`;
-  const ready = readyTasks(all).some((candidate) => candidate.id === task.id);
-  if (!ready) return `blocked by ${task.blockedBy.map((id) => `#${id}`).join(", ") || "dependency"}`;
+  // task is already confirmed pending, so it is ready iff it is not blocked.
+  // Checking directly avoids building the full ready list (the prior
+  // readyTasks(all).some(...) rebuilt the id index once per candidate task).
+  if (isTaskBlocked(task, all)) return `blocked by ${task.blockedBy.map((id) => `#${id}`).join(", ") || "dependency"}`;
   return undefined;
 }
 
@@ -264,7 +274,7 @@ async function runOneTask(
   try {
     const response = await requestSubagentRun(pi, ctx, params, signal, {
       onStarted: () => {
-        try { ctx.ui.setStatus("pi-tasks", `Task #${task.id} running via ${agent}`); } catch { /* stale UI */ }
+        safeSetStatus(ctx, `Task #${task.id} running via ${agent}`);
       },
       onUpdate: (update) => {
         // Prefer the per-run progress entry (index 0 for single runs) over the
@@ -272,7 +282,7 @@ async function runOneTask(
         const p = update.progress?.[0];
         const tool = (p?.currentTool ?? update.currentTool) ? ` ${p?.currentTool ?? update.currentTool}` : "";
         const count = p?.toolCount ?? update.toolCount ?? 0;
-        try { ctx.ui.setStatus("pi-tasks", `Task #${task.id}: ${count} tools${tool}`); } catch { /* stale UI */ }
+        safeSetStatus(ctx, `Task #${task.id}: ${count} tools${tool}`);
         // Route live activity into the per-task widget line (swarm-feel).
         // Ephemeral runtime state; never appended to session events.
         const toolName = p?.currentTool ?? update.currentTool;
@@ -311,7 +321,7 @@ async function runOneTask(
     onChange(TASK_RUN_FINISHED_EVENT, { taskId: task.id, runId: run.id, status });
     return `#${task.id}: ${status} — ${message}`;
   } finally {
-    try { ctx.ui.setStatus("pi-tasks", undefined); } catch { /* stale UI */ }
+    safeSetStatus(ctx, undefined);
   }
 }
 
@@ -363,7 +373,7 @@ async function runTasksInParallel(
   try {
     const response = await requestSubagentRun(pi, ctx, params, signal, {
       onStarted: () => {
-        try { ctx.ui.setStatus("pi-tasks", `Running ${runnable.length} tasks in parallel`); } catch { /* stale UI */ }
+        safeSetStatus(ctx, `Running ${runnable.length} tasks in parallel`);
       },
       onUpdate: (update) => {
         // Parallel updates carry a per-child progress array (each entry has its
@@ -377,10 +387,10 @@ async function runTasksInParallel(
             onActivity?.(scope, child.task.id, { tool: entry.currentTool, count: entry.toolCount ?? 0, ts: Date.now() });
           }
           const totalTools = entries.reduce((sum, e) => sum + (e.toolCount ?? 0), 0);
-          try { ctx.ui.setStatus("pi-tasks", `Parallel: ${runnable.length} tasks · ${totalTools} tools`); } catch { /* stale UI */ }
+          safeSetStatus(ctx, `Parallel: ${runnable.length} tasks · ${totalTools} tools`);
         } else {
           const tool = update.currentTool ? ` ${update.currentTool}` : "";
-          try { ctx.ui.setStatus("pi-tasks", `Parallel tasks: ${update.toolCount ?? 0} tools${tool}`); } catch { /* stale UI */ }
+          safeSetStatus(ctx, `Parallel tasks: ${update.toolCount ?? 0} tools${tool}`);
         }
       },
     });
@@ -426,7 +436,7 @@ async function runTasksInParallel(
     }
     return textResult(lines.join("\n"), { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
   } finally {
-    try { ctx.ui.setStatus("pi-tasks", undefined); } catch { /* stale UI */ }
+    safeSetStatus(ctx, undefined);
   }
 }
 

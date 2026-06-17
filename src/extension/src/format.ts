@@ -1,4 +1,4 @@
-import { indexById, type TaskItem, type TaskStatus, type TaskSubagentRef } from "./task-state.ts";
+import { unresolvedBlockers, type TaskItem, type TaskStatus, type TaskSubagentRef } from "./task-state.ts";
 
 export function statusIcon(status: TaskStatus): string {
   switch (status) {
@@ -33,11 +33,9 @@ export function formatDuration(ms: number): string {
   return remMin ? `${hr}h ${remMin}m` : `${hr}h`;
 }
 
-export function unresolvedBlockers(task: TaskItem, allTasks?: TaskItem[]): string[] {
-  if (!allTasks) return [...task.blockedBy];
-  const byId = indexById(allTasks);
-  return task.blockedBy.filter((id) => byId.get(id)?.status !== "completed");
-}
+// `unresolvedBlockers` lives in the pure task-state layer (canonical blocker-graph
+// logic); re-exported here so existing format callers and tests keep working.
+export { unresolvedBlockers };
 
 export function formatTaskLine(task: TaskItem, allTasks?: TaskItem[]): string {
   const openBlockers = unresolvedBlockers(task, allTasks);

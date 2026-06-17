@@ -343,18 +343,44 @@ export function createTask(input: TaskCreateInput, id: string): TaskItem {
   };
 }
 
-export function isTaskBlocked(task: TaskItem, tasks: Iterable<TaskItem>): boolean {
+/**
+ * Core readiness check against a prebuilt id→task index. O(task.blockedBy)
+ * per call — it never scans or rebuilds the full collection. Pass a single
+ * indexById() result when checking readiness for many tasks (the 150ms widget
+ * repaint, the parallel-run readiness loop, readyTasksWithIndex). This is the
+ * O(1)-index fix for the prior O(n²) path where readyTasks/isTaskBlocked each
+ * rebuilt the full id index once per candidate task.
+ */
+export function isTaskBlockedById(task: TaskItem, byId: Map<string, TaskItem>): boolean {
   if (task.status !== "pending") return true;
   if (task.blockedBy.length === 0) return false;
-  const byId = indexById(tasks);
   return task.blockedBy.some((id) => byId.get(id)?.status !== "completed");
+}
+
+/** Convenience wrapper that builds the index for a single readiness check. */
+export function isTaskBlocked(task: TaskItem, tasks: Iterable<TaskItem>): boolean {
+  return isTaskBlockedById(task, indexById(tasks));
+}
+
+/** Ready tasks against a prebuilt index — one filter pass, no per-task reindex. */
+export function readyTasksWithIndex(tasks: TaskItem[], byId: Map<string, TaskItem>): TaskItem[] {
+  return tasks.filter((task) => !isTaskBlockedById(task, byId)).sort(compareTasks);
 }
 
 export function readyTasks(tasks: Iterable<TaskItem>): TaskItem[] {
   const all = Array.from(tasks);
-  return all
-    .filter((task) => !isTaskBlocked(task, all))
-    .sort(compareTasks);
+  return readyTasksWithIndex(all, indexById(all));
+}
+
+/** Unresolved blocker ids for a task against a prebuilt index (canonical helper). */
+export function unresolvedBlockersById(task: TaskItem, byId: Map<string, TaskItem>): string[] {
+  return task.blockedBy.filter((id) => byId.get(id)?.status !== "completed");
+}
+
+/** Unresolved blocker ids, building the index once from the full task set. */
+export function unresolvedBlockers(task: TaskItem, allTasks?: TaskItem[] | Iterable<TaskItem>): string[] {
+  if (!allTasks) return [...task.blockedBy];
+  return unresolvedBlockersById(task, indexById(allTasks));
 }
 
 export function compareTasks(a: TaskItem, b: TaskItem): number {
@@ -668,7 +694,7 @@ export function evaluateClaim(
 
   const all = Array.from(tasks);
   const byId = indexById(all);
-  const blockedByTasks = task.blockedBy.filter((id) => byId.get(id)?.status !== "completed");
+  const blockedByTasks = unresolvedBlockersById(task, byId);
   if (blockedByTasks.length > 0) {
     return { success: false, reason: "blocked", task, blockedByTasks };
   }
