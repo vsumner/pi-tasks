@@ -5,6 +5,7 @@ Pi-native task tracking and subagent orchestration for [Pi](https://github.com/e
 This package brings the useful parts of Claude Code's task experience to Pi:
 
 - visible task list with completed/current/pending state
+- Claude-like widget behavior: stable ID order for normal-sized lists, priority buckets only when truncated, and brief completed-only display before hiding
 - tool-driven task creation and updates
 - dependency-aware ready work
 - one-command task execution through `pi-subagents`
@@ -29,6 +30,7 @@ This package ships raw TypeScript source and is intended to be loaded by Pi's ru
 | `TaskList` | Show all tasks or only ready work. |
 | `TaskGet` | Get full task details and run metadata. |
 | `TaskUpdate` | Update status/details/dependencies/metadata. |
+| `TaskClaim` | Safely claim task ownership without clobbering another owner or blocked/terminal work. |
 | `TaskRun` | Run one or more ready tasks through `pi-subagents`; supports foreground parallel mode with `parallel: true`. |
 | `TaskStatus` | Lightweight task/run status, with optional async status refresh. |
 | `TaskOutput` | Show saved output or refresh async subagent status. |
@@ -38,6 +40,10 @@ This package ships raw TypeScript source and is intended to be loaded by Pi's ru
 | `TaskStop` | Interrupt/cancel an in-flight subagent task. |
 
 `TaskRun` defaults to a foreground `pi-subagents` run so the parent session can inspect output and update state immediately. Pass `async: true` for background runs. For multiple ready tasks, pass `parallel: true` plus optional `concurrency` to use `pi-subagents` foreground parallel mode. Async parallel is intentionally not enabled until `pi-subagents` async completion exposes stable per-child task IDs.
+
+When background runs save outputs, `TaskOutput`, `TaskStatus`, and `TaskWait` lead with the saved output paths so agents can read the full result from disk instead of dumping large transcripts into context.
+
+`TaskClaim` is stricter than plain `TaskUpdate owner=...`: it refuses terminal tasks, unresolved blockers, existing owners, and optionally owners that already hold open work unless `force` explicitly overrides the owner-conflict checks.
 
 ## Commands
 
@@ -50,6 +56,7 @@ This package ships raw TypeScript source and is intended to be loaded by Pi's ru
 /tasks status [id]             show branch or task status
 /tasks run <id...>             run tasks through pi-subagents
 /tasks run ready --parallel    run ready tasks with foreground parallel subagents
+/tasks claim <id> [owner]      safely claim a task; add --start to mark in_progress
 /tasks output <id>             show task output/evidence
 /tasks stop <id>               interrupt/cancel an in-flight task
 /tasks resume <id> [message]   resume a pi-subagents run
@@ -76,7 +83,7 @@ pi-tasks:cleared
 pi-tasks:snapshot
 ```
 
-Event payloads include `version: 1`; legacy unversioned events still replay, while future-version events are ignored by this implementation. Snapshot events are optional compaction checkpoints and do not replace normal append-only task events.
+Event payloads include `version: 1`; legacy unversioned events still replay, while future-version events are ignored by this implementation. Snapshot events are optional compaction checkpoints and do not replace normal append-only task events. Snapshots also carry the branch high-water task ID so task numbers are not reused after delete/clear compaction.
 
 That means task lists branch naturally with Pi sessions. A `/fork` or `/tree` navigation reconstructs the task projection from the selected branch; no `.pi/tasks.json` is written during normal operation.
 

@@ -29,7 +29,7 @@ Run both before review.
 | `src/extension/src/session-key.ts` | Session-scoped task-store key helper. |
 | `src/extension/src/task-state.ts` | Public task types and pure reducer/projection helpers. |
 | `src/extension/src/task-store.ts` | Session-backed projection cache and mutation API. |
-| `src/extension/src/task-tools.ts` | LLM tools: `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskRun`, `TaskStatus`, `TaskOutput`, `TaskResume`, `TaskRetry`, `TaskWait`, `TaskStop`. |
+| `src/extension/src/task-tools.ts` | LLM tools: `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskClaim`, `TaskRun`, `TaskStatus`, `TaskOutput`, `TaskResume`, `TaskRetry`, `TaskWait`, `TaskStop`. |
 | `src/extension/src/subagents.ts` | Event bridge to `pi-subagents`; no orchestration logic elsewhere. |
 | `src/extension/src/widget.ts` | Claude-like task status widget. |
 | `src/extension/src/task-commands.ts` | `/tasks` command UI. |

@@ -469,3 +469,83 @@ export function summarizeTask(task: TaskItem): string {
   const ownerText = task.owner ? ` owner=${task.owner}` : "";
   return `#${task.id} [${task.status}] ${task.title}${blockerText}${ownerText}`;
 }
+
+// ---------------------------------------------------------------------------
+// Safe task owner claim
+//
+// Inspired by Claude's claimTask but without file persistence. The pure
+// evaluateClaim helper checks preconditions; taskStore.claimTask applies the
+// mutation when the check passes.
+// ---------------------------------------------------------------------------
+
+export function isTerminalStatus(status: TaskStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+export type ClaimTaskReason =
+  | "task_not_found"
+  | "invalid_owner"
+  | "already_claimed"
+  | "already_terminal"
+  | "blocked"
+  | "owner_busy";
+
+export interface ClaimTaskOptions {
+  owner: string;
+  /** Also set status=in_progress when the claim succeeds. */
+  start?: boolean;
+  /** Override the already_claimed and owner_busy constraints. Does not bypass terminal or blocked checks. */
+  force?: boolean;
+  /** When true, refuse if the owner already owns another non-terminal task. */
+  oneOpenPerOwner?: boolean;
+}
+
+export interface ClaimTaskResult {
+  success: boolean;
+  reason?: ClaimTaskReason;
+  task?: TaskItem;
+  /** Blocking dependency ids (present when reason is "blocked"). */
+  blockedByTasks?: string[];
+  /** Other open task ids the owner already holds (present when reason is "owner_busy"). */
+  busyWithTasks?: string[];
+}
+
+/**
+ * Pure precondition check for a safe owner claim. Returns a structured result
+ * describing why the claim would fail, or { success: true, task } when the task
+ * is claimable. Does not mutate.
+ */
+export function evaluateClaim(
+  task: TaskItem | null | undefined,
+  tasks: Iterable<TaskItem>,
+  options: ClaimTaskOptions,
+): ClaimTaskResult {
+  if (!task) return { success: false, reason: "task_not_found" };
+
+  const owner = options.owner.trim();
+  if (!owner) return { success: false, reason: "invalid_owner", task };
+
+  if (isTerminalStatus(task.status)) return { success: false, reason: "already_terminal", task };
+
+  if (task.owner && task.owner !== owner && !options.force) {
+    return { success: false, reason: "already_claimed", task };
+  }
+
+  const all = Array.from(tasks);
+  const byId = new Map(all.map((t) => [t.id, t] as const));
+  const blockedByTasks = task.blockedBy.filter((id) => byId.get(id)?.status !== "completed");
+  if (blockedByTasks.length > 0) {
+    return { success: false, reason: "blocked", task, blockedByTasks };
+  }
+
+  if (options.oneOpenPerOwner && !options.force) {
+    const busyWithTasks = all
+      .filter((t) => t.id !== task.id && t.owner === owner && !isTerminalStatus(t.status))
+      .map((t) => t.id);
+    if (busyWithTasks.length > 0) {
+      return { success: false, reason: "owner_busy", task, busyWithTasks };
+    }
+  }
+
+  return { success: true, task };
+}

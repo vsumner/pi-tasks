@@ -1,8 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatDuration, statusIcon, statusRank, taskStats } from "./format.ts";
+import { formatDuration, primarySavedOutput, runOutputPaths, statusIcon, taskStats } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
-import { readyTasks, type TaskItem } from "./task-state.ts";
+import { isTaskBlocked, readyTasks, type TaskItem, type TaskStatus } from "./task-state.ts";
 
 export interface TaskWidgetRuntime {
   latestCtx: ExtensionContext | null;
@@ -10,7 +10,7 @@ export interface TaskWidgetRuntime {
   widgetFrame: number;
 }
 
-type Theme = {
+export type Theme = {
   fg(color: string, text: string): string;
   bold(text: string): string;
   strikethrough(text: string): string;
@@ -18,14 +18,53 @@ type Theme = {
 
 const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽"];
 const DEFAULT_MAX_VISIBLE = 10;
-const RECENT_COMPLETED_TTL_MS = 30_000;
+export const RECENT_COMPLETED_TTL_MS = 30_000;
+export const COMPLETED_ONLY_HIDE_MS = 5_000;
 
-function taskSort(a: TaskItem, b: TaskItem): number {
-  const byRank = statusRank(a.status) - statusRank(b.status);
-  if (byRank !== 0) return byRank;
+// Display priority buckets, lowest rank renders first. Mirrors the Claude
+// task-list order adapted for Pi's richer status model: recent completed is
+// surfaced briefly, then active work, then ready/blocked pending, terminal
+// states, and finally stale completed at the bottom.
+const RECENT_COMPLETED_RANK = 0;
+const IN_PROGRESS_RANK = 1;
+const READY_PENDING_RANK = 2;
+const BLOCKED_RANK = 3;
+const TERMINAL_RANK = 4;
+const OLD_COMPLETED_RANK = 5;
+
+function byId(a: TaskItem, b: TaskItem): number {
   const numeric = Number(a.id) - Number(b.id);
   if (Number.isFinite(numeric) && numeric !== 0) return numeric;
   return a.id.localeCompare(b.id);
+}
+
+function displayRank(task: TaskItem, all: TaskItem[], nowMs: number): number {
+  switch (task.status) {
+    case "completed":
+      return isRecentlyCompleted(task, nowMs) ? RECENT_COMPLETED_RANK : OLD_COMPLETED_RANK;
+    case "in_progress":
+      return IN_PROGRESS_RANK;
+    case "pending":
+      return isTaskBlocked(task, all) ? BLOCKED_RANK : READY_PENDING_RANK;
+    case "blocked":
+      return BLOCKED_RANK;
+    case "failed":
+    case "cancelled":
+      return TERMINAL_RANK;
+  }
+}
+
+function sortByDisplayRank(tasks: TaskItem[], nowMs: number): TaskItem[] {
+  return [...tasks].sort((a, b) => {
+    const rankA = displayRank(a, tasks, nowMs);
+    const rankB = displayRank(b, tasks, nowMs);
+    if (rankA !== rankB) return rankA - rankB;
+    return byId(a, b);
+  });
+}
+
+function sortStableById(tasks: TaskItem[]): TaskItem[] {
+  return [...tasks].sort(byId);
 }
 
 function activeElapsed(task: TaskItem): string | undefined {
@@ -62,40 +101,104 @@ function renderTask(task: TaskItem, all: TaskItem[], theme: Theme, frame: number
   const asyncBadge = task.status === "in_progress" && (task.run?.status === "detached" || task.run?.subagent.asyncId) ? theme.fg("dim", " async") : "";
   const elapsed = task.status === "in_progress" ? activeElapsed(task) : undefined;
   const stats = elapsed ? theme.fg("dim", ` (${elapsed}${asyncBadge ? ", async" : ""})`) : asyncBadge;
-  const latestEvidence = task.status === "completed" ? task.evidence.at(-1)?.text : undefined;
-  const proof = latestEvidence ? theme.fg("dim", ` › ${latestEvidence.replace(/\s+/g, " ").slice(0, 80)}`) : "";
+  // Completed async/background runs that saved an output file get a compact
+  // "output saved → <path>" hint instead of dumping the evidence/output content
+  // inline. Other completed tasks keep showing the last evidence line.
+  const savedOutputPath = task.status === "completed" && task.run?.subagent.asyncId
+    ? primarySavedOutput(runOutputPaths(task.run?.subagent))
+    : undefined;
+  const latestEvidence = !savedOutputPath && task.status === "completed" ? task.evidence.at(-1)?.text : undefined;
+  const proof = savedOutputPath
+    ? theme.fg("dim", ` › output saved → ${savedOutputPath}`)
+    : latestEvidence ? theme.fg("dim", ` › ${latestEvidence.replace(/\s+/g, " ").slice(0, 80)}`) : "";
 
   return truncateToWidth(`  ${icon} ${id} ${title}${owner}${stats}${blocked}${proof}`, width);
 }
 
-function hiddenSummary(tasks: TaskItem[]): string {
-  const counts = new Map<string, number>();
-  for (const task of tasks) counts.set(task.status, (counts.get(task.status) ?? 0) + 1);
-  return Array.from(counts.entries()).map(([status, count]) => `${count} ${status}`).join(", ");
+const HIDDEN_SUMMARY_ORDER: ReadonlyArray<TaskStatus> = [
+  "in_progress",
+  "pending",
+  "blocked",
+  "failed",
+  "cancelled",
+  "completed",
+];
+
+function hiddenStatusLabel(status: TaskStatus): string {
+  switch (status) {
+    case "in_progress": return "active";
+    case "pending": return "open";
+    case "blocked": return "blocked";
+    case "failed": return "failed";
+    case "cancelled": return "cancelled";
+    case "completed": return "done";
+  }
 }
 
-function isRecentlyCompleted(task: TaskItem, nowMs: number): boolean {
+export function hiddenSummary(tasks: TaskItem[]): string {
+  const counts = new Map<TaskStatus, number>();
+  for (const task of tasks) counts.set(task.status, (counts.get(task.status) ?? 0) + 1);
+  const parts: string[] = [];
+  for (const status of HIDDEN_SUMMARY_ORDER) {
+    const count = counts.get(status);
+    if (count) parts.push(`${count} ${hiddenStatusLabel(status)}`);
+  }
+  return parts.join(", ");
+}
+
+export function isRecentlyCompleted(task: TaskItem, nowMs: number): boolean {
   if (task.status !== "completed") return true;
   const updatedAt = Date.parse(task.updatedAt);
   return Number.isFinite(updatedAt) && nowMs - updatedAt <= RECENT_COMPLETED_TTL_MS;
 }
 
-function renderLines(tasks: TaskItem[], theme: Theme, frame: number, width: number): string[] {
-  if (tasks.length === 0) return [];
+function isCompletedOnlyStillVisible(task: TaskItem, nowMs: number): boolean {
+  const updatedAt = Date.parse(task.updatedAt);
+  return Number.isFinite(updatedAt) && nowMs - updatedAt <= COMPLETED_ONLY_HIDE_MS;
+}
+
+export interface WidgetPlan {
+  sorted: TaskItem[];
+  visible: TaskItem[];
+  hidden: TaskItem[];
+}
+
+/**
+ * Decide which tasks the compact widget should show. Returns null when there
+ * is nothing worth rendering: no tasks at all, or only completed tasks older
+ * than Claude's completed-only hide delay with nothing else going on.
+ * Canonical task state is never mutated here — this is a pure display
+ * projection over the session-backed store. Normal-sized lists stay in stable
+ * ID order; priority buckets are only used when truncating, matching Claude's
+ * TaskListV2 behavior.
+ */
+export function planWidget(
+  tasks: TaskItem[],
+  nowMs: number = Date.now(),
+  maxVisible: number = DEFAULT_MAX_VISIBLE,
+): WidgetPlan | null {
+  if (tasks.length === 0) return null;
+  const hasOpenWork = tasks.some((task) => task.status !== "completed");
+  // Only completed tasks remain and the brief completion window expired → hide
+  // the widget entirely without deleting canonical task state.
+  if (!hasOpenWork && !tasks.some((task) => isCompletedOnlyStillVisible(task, nowMs))) return null;
+  const sorted = tasks.length > maxVisible ? sortByDisplayRank(tasks, nowMs) : sortStableById(tasks);
+  return { sorted, visible: sorted.slice(0, maxVisible), hidden: sorted.slice(maxVisible) };
+}
+
+export function renderLines(tasks: TaskItem[], theme: Theme, frame: number, width: number): string[] {
+  const plan = planWidget(tasks, Date.now());
+  if (!plan) return [];
   const maxW = Math.max(1, width);
-  const sorted = [...tasks].sort(taskSort);
-  const readyCount = readyTasks(sorted).length;
-  const failedCount = sorted.filter((task) => task.status === "failed").length;
-  const headerBits = [taskStats(sorted)];
+  const readyCount = readyTasks(tasks).length;
+  const failedCount = tasks.filter((task) => task.status === "failed").length;
+  const headerBits = [taskStats(tasks)];
   if (readyCount) headerBits.push(`${readyCount} ready`);
   if (failedCount) headerBits.push(`${failedCount} failed`);
   const header = truncateToWidth(`${theme.fg("accent", "●")} ${theme.fg("accent", headerBits.join(" · "))}`, maxW);
-  const displayCandidates = sorted.filter((task) => isRecentlyCompleted(task, Date.now()));
-  const visible = displayCandidates.slice(0, DEFAULT_MAX_VISIBLE);
-  const hidden = sorted.filter((task) => !visible.some((v) => v.id === task.id));
-  const lines = [header, ...visible.map((task) => renderTask(task, sorted, theme, frame, maxW))];
-  if (hidden.length > 0) {
-    lines.push(truncateToWidth(theme.fg("dim", `    … and ${hidden.length} more (${hiddenSummary(hidden)})`), maxW));
+  const lines = [header, ...plan.visible.map((task) => renderTask(task, tasks, theme, frame, maxW))];
+  if (plan.hidden.length > 0) {
+    lines.push(truncateToWidth(theme.fg("dim", `    … and ${plan.hidden.length} more (${hiddenSummary(plan.hidden)})`), maxW));
   }
   return lines;
 }
@@ -115,35 +218,65 @@ export function createTaskWidget(
     }
   }
 
-  function refresh(ctx: ExtensionContext): void {
-    const rt = getRuntime(ctx);
-    rt.latestCtx = ctx;
-    if (!ctx.hasUI) return;
-
-    const tasks = store.readAll(storeKey(ctx));
-    if (tasks.length === 0) {
-      clear(ctx, rt);
-      return;
-    }
-
-    const hasActive = tasks.some((task) => task.status === "in_progress");
-    if (hasActive && !rt.widgetTimer) {
-      rt.widgetTimer = setInterval(() => {
-        const latest = rt.latestCtx;
-        if (!latest?.hasUI) return;
-        rt.widgetFrame++;
-        try { latest.ui.setWidget("pi-tasks", makeWidget(latest, rt), { placement: "aboveEditor" }); } catch { /* stale UI */ }
-      }, 150);
-    } else if (!hasActive && rt.widgetTimer) {
-      clearInterval(rt.widgetTimer);
-      rt.widgetTimer = null;
-    }
-
+  function repaint(ctx: ExtensionContext, rt: TaskWidgetRuntime): void {
     try {
       ctx.ui.setWidget("pi-tasks", makeWidget(ctx, rt), { placement: "aboveEditor" });
     } catch {
       // UI may be stale during session replacement.
     }
+  }
+
+  function needsTimer(tasks: TaskItem[], nowMs: number): boolean {
+    return tasks.some((task) => task.status === "in_progress")
+      || tasks.some((task) => task.status === "completed" && isRecentlyCompleted(task, nowMs));
+  }
+
+  function refresh(ctx: ExtensionContext): void {
+    const rt = getRuntime(ctx);
+    rt.latestCtx = ctx;
+    if (!ctx.hasUI) return;
+
+    const nowMs = Date.now();
+    const tasks = store.readAll(storeKey(ctx));
+
+    // Hide the widget when there is nothing worth showing (no tasks, or only
+    // stale completed tasks). Canonical task state is left untouched.
+    if (!planWidget(tasks, nowMs)) {
+      clear(ctx, rt);
+      return;
+    }
+
+    // Keep the animation/refresh timer alive while there is active work or a
+    // recent completion that will expire (~30s). Without this, a task that
+    // completes with nothing else running would freeze on screen forever.
+    if (needsTimer(tasks, nowMs)) {
+      if (!rt.widgetTimer) {
+        rt.widgetTimer = setInterval(() => {
+          const latest = rt.latestCtx;
+          if (!latest?.hasUI) return;
+          rt.widgetFrame++;
+          const current = store.readAll(storeKey(latest));
+          const currentMs = Date.now();
+          // Stale-completed-only (or emptied) state → hide and stop ticking.
+          if (!planWidget(current, currentMs)) {
+            clear(latest, rt);
+            return;
+          }
+          // Recent completion expired and nothing is active → final repaint,
+          // then stop the timer so it does not spin idly.
+          if (!needsTimer(current, currentMs) && rt.widgetTimer) {
+            clearInterval(rt.widgetTimer);
+            rt.widgetTimer = null;
+          }
+          repaint(latest, rt);
+        }, 150);
+      }
+    } else if (rt.widgetTimer) {
+      clearInterval(rt.widgetTimer);
+      rt.widgetTimer = null;
+    }
+
+    repaint(ctx, rt);
   }
 
   function makeWidget(ctx: ExtensionContext, rt: TaskWidgetRuntime) {

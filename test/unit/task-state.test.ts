@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TASK_CLEARED_EVENT, TASK_CREATED_EVENT, TASK_EVIDENCE_RECORDED_EVENT, TASK_RUN_FINISHED_EVENT, TASK_RUN_STARTED_EVENT, TASK_UPDATED_EVENT } from "../../src/extension/src/events.ts";
-import { createTask, projectTasksFromEvents, readyTasks, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
+import { TASK_CLEARED_EVENT, TASK_CREATED_EVENT, TASK_EVIDENCE_RECORDED_EVENT, TASK_RUN_FINISHED_EVENT, TASK_RUN_STARTED_EVENT, TASK_STATUS_UPDATED_EVENT, TASK_UPDATED_EVENT } from "../../src/extension/src/events.ts";
+import { createTask, evaluateClaim, projectTasksFromEvents, readyTasks, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
 
 test("projects created tasks and ready dependency order", () => {
   const first = createTask({ title: "Setup", prompt: "Do setup" }, "1");
@@ -158,4 +158,101 @@ test("clear all removes every task", () => {
   ]);
 
   assert.deepEqual(tasks, []);
+});
+
+test("evaluateClaim succeeds for a pending unowned task", () => {
+  const task = createTask({ title: "Claim me", prompt: "Work" }, "1");
+  const result = evaluateClaim(task, [task], { owner: "alice" });
+  assert.equal(result.success, true);
+  assert.equal(result.task?.id, "1");
+  assert.equal(result.reason, undefined);
+});
+
+test("evaluateClaim returns task_not_found for a null task", () => {
+  const result = evaluateClaim(null, [], { owner: "alice" });
+  assert.equal(result.success, false);
+  assert.equal(result.reason, "task_not_found");
+});
+
+test("evaluateClaim rejects blank owners", () => {
+  const task = createTask({ title: "Claim me", prompt: "Work" }, "1");
+  for (const owner of ["", "   "]) {
+    const result = evaluateClaim(task, [task], { owner });
+    assert.equal(result.success, false);
+    assert.equal(result.reason, "invalid_owner");
+  }
+});
+
+test("evaluateClaim returns already_terminal for completed, failed, and cancelled tasks", () => {
+  const base = createTask({ title: "Done", prompt: "Finished" }, "1");
+  for (const status of ["completed", "failed", "cancelled"] as const) {
+    const task = { ...base, status };
+    const result = evaluateClaim(task, [task], { owner: "alice" });
+    assert.equal(result.success, false);
+    assert.equal(result.reason, "already_terminal");
+  }
+});
+
+test("evaluateClaim returns already_claimed when another owner holds the task", () => {
+  const task = { ...createTask({ title: "Owned", prompt: "Work" }, "1"), owner: "bob" };
+  const result = evaluateClaim(task, [task], { owner: "alice" });
+  assert.equal(result.success, false);
+  assert.equal(result.reason, "already_claimed");
+  assert.equal(result.task?.owner, "bob");
+});
+
+test("evaluateClaim force overrides already_claimed", () => {
+  const task = { ...createTask({ title: "Owned", prompt: "Work" }, "1"), owner: "bob" };
+  const result = evaluateClaim(task, [task], { owner: "alice", force: true });
+  assert.equal(result.success, true);
+});
+
+test("evaluateClaim allows the same owner to re-claim", () => {
+  const task = { ...createTask({ title: "Mine", prompt: "Work" }, "1"), owner: "alice" };
+  const result = evaluateClaim(task, [task], { owner: "alice" });
+  assert.equal(result.success, true);
+});
+
+test("evaluateClaim returns blocked with unresolved dependency ids", () => {
+  const blocker = createTask({ title: "Blocker", prompt: "First" }, "1");
+  const target = createTask({ title: "Target", prompt: "Second", blockedBy: ["1"] }, "2");
+  const result = evaluateClaim(target, [blocker, target], { owner: "alice" });
+  assert.equal(result.success, false);
+  assert.equal(result.reason, "blocked");
+  assert.deepEqual(result.blockedByTasks, ["1"]);
+});
+
+test("evaluateClaim blocked clears when dependency completes", () => {
+  const blocker = { ...createTask({ title: "Blocker", prompt: "First" }, "1"), status: "completed" as const };
+  const target = createTask({ title: "Target", prompt: "Second", blockedBy: ["1"] }, "2");
+  const result = evaluateClaim(target, [blocker, target], { owner: "alice" });
+  assert.equal(result.success, true);
+});
+
+test("evaluateClaim returns owner_busy when one_open_per_owner is set and owner has open work", () => {
+  const open = { ...createTask({ title: "Open", prompt: "In progress" }, "1"), owner: "alice", status: "in_progress" as const };
+  const target = createTask({ title: "Target", prompt: "Claim me" }, "2");
+  const result = evaluateClaim(target, [open, target], { owner: "alice", oneOpenPerOwner: true });
+  assert.equal(result.success, false);
+  assert.equal(result.reason, "owner_busy");
+  assert.deepEqual(result.busyWithTasks, ["1"]);
+});
+
+test("evaluateClaim owner_busy does not count terminal tasks owned by the owner", () => {
+  const done = { ...createTask({ title: "Done", prompt: "Finished" }, "1"), owner: "alice", status: "completed" as const };
+  const target = createTask({ title: "Target", prompt: "Claim me" }, "2");
+  const result = evaluateClaim(target, [done, target], { owner: "alice", oneOpenPerOwner: true });
+  assert.equal(result.success, true);
+});
+
+test("evaluateClaim force overrides owner_busy but not terminal or blocked", () => {
+  const open = { ...createTask({ title: "Open", prompt: "In progress" }, "1"), owner: "alice", status: "in_progress" as const };
+  const target = createTask({ title: "Target", prompt: "Claim me" }, "2");
+  const result = evaluateClaim(target, [open, target], { owner: "alice", oneOpenPerOwner: true, force: true });
+  assert.equal(result.success, true);
+
+  const terminal = { ...createTask({ title: "Done", prompt: "Done" }, "3"), status: "completed" as const };
+  const forceTerminal = evaluateClaim(terminal, [terminal], { owner: "alice", force: true });
+  assert.equal(forceTerminal.success, false);
+  assert.equal(forceTerminal.reason, "already_terminal");
 });

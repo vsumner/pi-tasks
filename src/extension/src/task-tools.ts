@@ -10,7 +10,7 @@ import {
   TASK_STATUS_UPDATED_EVENT,
   TASK_UPDATED_EVENT,
 } from "./events.ts";
-import { formatTaskLine, statusRank, textBlock } from "./format.ts";
+import { formatOutputFilesSection, formatTaskLine, outputReadHint, runOutputPaths, statusRank, textBlock } from "./format.ts";
 import {
   buildTaskPrompt,
   requestSubagentRun,
@@ -96,6 +96,17 @@ const TaskUpdateParams = Type.Object({
 });
 
 type TaskUpdateArgs = Static<typeof TaskUpdateParams>;
+
+const TaskClaimParams = Type.Object({
+  taskId: Type.Optional(Type.String({ description: "Task ID to claim." })),
+  task_id: Type.Optional(Type.String({ description: "Task ID (snake_case alias)." })),
+  owner: Type.String({ minLength: 1, description: "Owner identifier claiming the task (agent name, run id, or user)." }),
+  start: Type.Optional(Type.Boolean({ description: "Also set status=in_progress. Default false." })),
+  force: Type.Optional(Type.Boolean({ description: "Override an existing owner and the one-open-per-owner constraint. Does not bypass terminal or blocked checks." })),
+  one_open_per_owner: Type.Optional(Type.Boolean({ description: "Refuse if the owner already owns another non-terminal task. Default false." })),
+});
+
+type TaskClaimArgs = Static<typeof TaskClaimParams>;
 
 const TaskRunParams = Type.Object({
   taskId: Type.Optional(Type.String({ description: "Single task ID to run." })),
@@ -329,6 +340,21 @@ function firstLine(text: string, max = 240): string {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
+function activeFormHint(activeForm: string | undefined): string {
+  return activeForm && activeForm.trim()
+    ? ""
+    : "\nTip: set activeForm to a present-continuous label (e.g. 'Running tests') so the task shows useful progress while in_progress.";
+}
+
+function completionFollowupHint(scope: string): string {
+  const all = taskStore.readAll(scope);
+  const ready = readyTasks(all);
+  if (ready.length === 0) return "\n\nTask completed. Call TaskList now to confirm no ready follow-up work remains.";
+  const shown = ready.slice(0, 5).map((task) => `#${task.id}`).join(", ");
+  const more = ready.length > 5 ? `, +${ready.length - 5} more` : "";
+  return `\n\nTask completed. Call TaskList now to find newly unblocked work. Ready: ${shown}${more}.`;
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -414,7 +440,9 @@ async function runOneTask(
       asyncId: subagent.asyncId,
     }));
     onChange(TASK_RUN_FINISHED_EVENT, { taskId: task.id, runId: run.id, status });
-    return `#${task.id}: ${status}${subagent.asyncId ? ` (async ${subagent.asyncId})` : ""}`;
+    const asyncLaunched = status === "detached" || Boolean(subagent.asyncId);
+    const hint = asyncLaunched ? outputReadHint(runOutputPaths(subagent)) : undefined;
+    return `#${task.id}: ${status}${subagent.asyncId ? ` (async ${subagent.asyncId})` : ""}${hint ? ` — ${hint}` : ""}`;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const cancelled = /cancelled|canceled|aborted/i.test(message);
@@ -483,6 +511,7 @@ async function runTasksInParallel(
     const overall = summarizeSubagentResponse(response);
     const results = response.result.details?.results ?? [];
     const lines = [...skipped];
+    let completedCount = 0;
     for (const [index, item] of runnable.entries()) {
       const result = results[index];
       const status = resultStatus(response, result);
@@ -502,9 +531,10 @@ async function runTasksInParallel(
         parallelIndex: index,
       }));
       onChange(TASK_RUN_FINISHED_EVENT, { taskId: item.task.id, runId: item.run.id, status, parallel: true });
+      if (status === "completed" && item.task.status !== "completed") completedCount += 1;
       lines.push(`#${item.task.id}: ${status}`);
     }
-    return textResult(lines.join("\n"), { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
+    return textResult(`${lines.join("\n")}${completedCount > 0 ? completionFollowupHint(scope) : ""}`, { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const cancelled = /cancelled|canceled|aborted/i.test(message);
@@ -536,6 +566,7 @@ function parseAsyncSummaryStatus(summary: string): { status?: TaskRunStatus; war
 }
 
 async function refreshAsyncStatus(pi: ExtensionAPI, ctx: ExtensionContext, task: TaskItem, signal?: AbortSignal): Promise<string | undefined> {
+  if (task.status !== "in_progress") return undefined;
   if (!task.run) return undefined;
   if (!task.run.subagent.asyncId && task.run.status !== "detached") return undefined;
   const id = task.run.subagent.asyncId ?? task.run.subagent.runId;
@@ -581,6 +612,7 @@ export async function runTasks(
   }
 
   const lines: string[] = [];
+  let completedCount = 0;
   for (const id of ids) {
     if (signal?.aborted) {
       lines.push("TaskRun aborted before remaining tasks started.");
@@ -591,10 +623,13 @@ export async function runTasks(
       lines.push(`#${id}: not found`);
       continue;
     }
+    const beforeStatus = task.status;
     const line = await runOneTask(pi, ctx, task, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data));
+    const latest = taskStore.readTask(scope, id);
+    if (latest?.status === "completed" && beforeStatus !== "completed") completedCount += 1;
     lines.push(line);
   }
-  return textResult(lines.join("\n"), { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
+  return textResult(`${lines.join("\n")}${completedCount > 0 ? completionFollowupHint(scope) : ""}`, { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
 }
 
 export async function getTaskStatus(
@@ -613,7 +648,7 @@ export async function getTaskStatus(
     const active = allTasks.filter((task) => task.status === "in_progress").length;
     const failed = allTasks.filter((task) => task.status === "failed").length;
     const lines = [`${tasks.length} task${tasks.length === 1 ? "" : "s"}: ${active} active, ${ready} ready, ${failed} failed`];
-    if (tasks.length > 0) lines.push(...tasks.slice(0, 12).map(formatTaskLine));
+    if (tasks.length > 0) lines.push(...tasks.slice(0, 12).map((task) => formatTaskLine(task, allTasks)));
     return textResult(lines.join("\n"), { tasks, ready, active, failed });
   }
 
@@ -625,9 +660,11 @@ export async function getTaskStatus(
   }
   const latest = taskStore.readTask(scope, id) ?? before;
   if (latest.status !== before.status) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
-  const lines = [formatTaskLine(latest)];
+  const lines = [formatTaskLine(latest, taskStore.readAll(scope))];
   if (latest.run) lines.push(`run: ${latest.run.status} via ${latest.run.agent}${taskRunRefId(latest) ? ` (${taskRunRefId(latest)})` : ""}`);
   if (refreshed) lines.push(`refresh: ${firstLine(refreshed)}`);
+  const statusHint = outputReadHint(runOutputPaths(latest.run?.subagent));
+  if (statusHint) lines.push(statusHint);
   return textResult(lines.join("\n"), { task: latest, refreshed });
 }
 
@@ -649,8 +686,10 @@ export async function getTaskOutput(
   }
   const latest = taskStore.readTask(scope, id) ?? task;
   if (latest.status !== task.status) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
+  const paths = runOutputPaths(latest.run?.subagent);
   const sections = [
     `Task #${latest.id} [${latest.status}] ${latest.title}`,
+    formatOutputFilesSection(paths),
     refreshed ? `## pi-subagents status\n${refreshed}` : undefined,
     latest.run?.output ? `## Run output\n${latest.run.output}` : undefined,
     latest.evidence.length > 0 ? `## Evidence\n${latest.evidence.map((e) => `- [${e.kind}] ${e.text}`).join("\n")}` : undefined,
@@ -721,7 +760,7 @@ export async function resumeTask(
     taskStore.finishRun(scope, id, status, { summary, output: summary, error: status === "failed" ? response.errorText ?? summary : undefined, usage, subagent });
     taskStore.recordEvidence(scope, id, makeEvidence(status === "failed" ? "error" : "output", summary, { source: "TaskResume", resumedFrom: runId }));
     onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, runId: run.id, status });
-    return textResult(`Task #${id} resumed: ${status}`, { task: taskStore.readTask(scope, id) });
+    return textResult(`Task #${id} resumed: ${status}${status === "completed" ? completionFollowupHint(scope) : ""}`, { task: taskStore.readTask(scope, id) });
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
     const cancelled = /cancelled|canceled|aborted/i.test(messageText);
@@ -769,14 +808,20 @@ export async function waitForTask(
   while (Date.now() <= deadline) {
     const task = taskStore.readTask(scope, id);
     if (!task) return textResult(`Task #${id} not found.`, { task: null });
-    if (terminalTaskStatus(task.status)) return textResult(`Task #${id} finished: ${task.status}${lastRefresh ? `\n${firstLine(lastRefresh)}` : ""}`, { task });
+    if (terminalTaskStatus(task.status)) {
+      const waitHint = outputReadHint(runOutputPaths(task.run?.subagent));
+      return textResult(`Task #${id} finished: ${task.status}${waitHint ? `\n${waitHint}` : ""}${lastRefresh ? `\n${firstLine(lastRefresh)}` : ""}`, { task });
+    }
     if (task.run?.subagent.asyncId || task.run?.status === "detached") {
       try {
         const before = task.status;
         lastRefresh = await refreshAsyncStatus(pi, ctx, task, signal);
         const latest = taskStore.readTask(scope, id) ?? task;
         if (latest.status !== before) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
-        if (terminalTaskStatus(latest.status)) return textResult(`Task #${id} finished: ${latest.status}\n${firstLine(lastRefresh ?? "")}`, { task: latest });
+        if (terminalTaskStatus(latest.status)) {
+          const waitHint = outputReadHint(runOutputPaths(latest.run?.subagent));
+          return textResult(`Task #${id} finished: ${latest.status}${waitHint ? `\n${waitHint}` : ""}\n${firstLine(lastRefresh ?? "")}`, { task: latest });
+        }
       } catch (error) {
         lastRefresh = `Status refresh failed: ${error instanceof Error ? error.message : String(error)}`;
       }
@@ -794,12 +839,14 @@ export function registerTaskTools(
   pi.registerTool({
     name: "TaskCreate",
     label: "TaskCreate",
-    description: `Create a Claude-style task in the current Pi session branch. Use for non-trivial multi-step work, explicit task-list requests, or subagent packets. Do not create tasks for one trivial action.`,
-    promptSnippet: "Create a task with subject, description, dependencies, and optional subagent agent",
+    description: `Create a task in the current Pi session branch. Use proactively for complex multi-step work (3+ steps), multi-part requests, or subagent packets. Do not create tasks for a single trivial action or purely informational questions.`,
+    promptSnippet: "Create a task with subject, description, activeForm, dependencies, and optional subagent agent",
     promptGuidelines: [
-      "Create tasks proactively for complex multi-step work or when the user asks for a task list.",
-      "Use one task per bounded deliverable, not one vague catch-all task.",
+      "Create tasks proactively for complex multi-step work (3+ steps), when the user gives multiple tasks, or when asked for a task list. Skip tasks for a single trivial action or an informational question.",
+      "Use one task per bounded deliverable; break complex work into specific, actionable items rather than one vague catch-all task.",
+      "Provide subject in imperative form (e.g. 'Run tests') and activeForm in present-continuous form (e.g. 'Running tests'). activeForm is shown while the task is in_progress.",
       "Set agent when the task should be executable through pi-subagents via TaskRun.",
+      "Check TaskList first when there may already be a task for the same work; avoid duplicate tasks.",
       "Use source='pi-goals' and metadata {goalId, packetId} for goal packet integration.",
     ],
     parameters: TaskCreateParams,
@@ -819,7 +866,8 @@ export function registerTaskTools(
         metadata: params.metadata,
       });
       onTaskChanged(ctx, TASK_CREATED_EVENT, { taskId: task.id });
-      return textResult(`Task #${task.id} created: ${task.title}`, { task, taskEvent: { customType: TASK_CREATED_EVENT, data: { taskId: task.id, task } } });
+      const created = `Task #${task.id} created: ${task.title}`;
+      return textResult(`${created}${activeFormHint(task.activeForm)}`, { task, taskEvent: { customType: TASK_CREATED_EVENT, data: { taskId: task.id, task } } });
     },
     renderCall(args: { subject?: unknown }, theme: Theme) {
       const subject = typeof args.subject === "string" ? args.subject : "task";
@@ -831,13 +879,18 @@ export function registerTaskTools(
     name: "TaskList",
     label: "TaskList",
     description: "List tasks on the current Pi session branch. Use ready_only to find unblocked pending work.",
-    promptGuidelines: ["Call TaskList after completing a task to find ready follow-up work."],
+    promptGuidelines: [
+      "Call TaskList after completing a task to find ready follow-up work.",
+      "Use ready_only=true to find tasks that are pending and unblocked by unresolved dependencies; check owner before claiming or starting work.",
+      "Prefer ready tasks in lowest-ID order when multiple tasks are available, because earlier tasks often set up context for later ones.",
+    ],
     parameters: TaskListParams,
     async execute(_id, params: TaskListArgs, _signal, _onUpdate, ctx) {
       const scope = taskStoreKey(ctx);
-      const tasks = sortedTasks(params.ready_only ? taskStore.ready(scope) : taskStore.readAll(scope), params);
+      const allTasks = taskStore.readAll(scope);
+      const tasks = sortedTasks(params.ready_only ? taskStore.ready(scope) : allTasks, params);
       if (tasks.length === 0) return textResult(params.ready_only ? "No ready tasks." : "No tasks found.", { tasks });
-      return textResult(tasks.map(formatTaskLine).join("\n"), { tasks });
+      return textResult(tasks.map((task) => formatTaskLine(task, allTasks)).join("\n"), { tasks });
     },
   });
 
@@ -858,10 +911,14 @@ export function registerTaskTools(
   pi.registerTool({
     name: "TaskUpdate",
     label: "TaskUpdate",
-    description: `Update a task. Mark tasks in_progress before direct work and completed only after proof. Use status='deleted' to delete a task.`,
+    description: `Update a task's status, subject, dependencies, or notes. Mark in_progress before starting direct work and completed only after the work is fully done with proof. Prefer blocked over false completion. Use status='deleted' to delete a task.`,
     promptGuidelines: [
-      "Never mark a task completed unless the described work is fully done and evidence exists.",
-      "If blocked, leave it blocked and create/update a task for the blocker.",
+      "Mark a task in_progress immediately before starting work on it, and complete it immediately after finishing — do not batch status updates.",
+      "Keep at most one task in_progress at a time; start a new task only after completing or blocking the current one. Intentional parallel TaskRun is allowed when work is genuinely independent.",
+      "Only mark completed when the work is fully done and you have proof (tests pass, implementation complete). Never complete if tests fail, the implementation is partial, or errors are unresolved.",
+      "If blocked or unable to finish, keep the task in_progress or set it blocked, and create a separate task for the blocker rather than marking false completion.",
+      "Read the latest task state with TaskGet before updating if there is any chance another agent changed it.",
+      "After marking a task completed, call TaskList ready_only=true to find newly unblocked work or confirm no ready tasks remain.",
       "Use addBlockedBy/addBlocks to encode ordering instead of prose-only ordering.",
     ],
     parameters: TaskUpdateParams,
@@ -894,6 +951,7 @@ export function registerTaskTools(
         metadata: params.metadata,
       };
       const scope = taskStoreKey(ctx);
+      const before = taskStore.readTask(scope, id);
       let task = taskStore.updateTask(scope, id, update);
       if (params.note?.trim()) {
         task = taskStore.recordEvidence(scope, id, makeEvidence("note", params.note.trim(), { source: "TaskUpdate" }));
@@ -901,7 +959,45 @@ export function registerTaskTools(
       } else {
         onTaskChanged(ctx, TASK_UPDATED_EVENT, { taskId: id });
       }
-      return textResult(`Updated task #${id}: ${task.status} — ${task.title}`, { task });
+      const completionHint = params.status === "completed" && before?.status !== "completed"
+        ? completionFollowupHint(scope)
+        : "";
+      return textResult(`Updated task #${id}: ${task.status} — ${task.title}${completionHint}`, { task });
+    },
+  });
+
+  pi.registerTool({
+    name: "TaskClaim",
+    label: "TaskClaim",
+    description: `Safely claim ownership of a task. Sets owner (and optionally status=in_progress) only when the task is not terminal, not blocked, and not already owned by another owner (unless force=true). Use this instead of TaskUpdate owner when you need claim-or-report semantics. Existing TaskUpdate owner assignment is unchanged.`,
+    promptGuidelines: [
+      "Use TaskClaim to atomically take ownership of a task before starting work on it; it reports structured failure reasons rather than silently overwriting an existing owner.",
+      "A claim fails with invalid_owner for blank owners, already_terminal for completed/failed/cancelled tasks, blocked when dependencies are unresolved, already_claimed when another owner holds the task, and owner_busy when one_open_per_owner is set and you already own open work.",
+      "Pass force=true to override already_claimed and owner_busy only; terminal and blocked tasks cannot be force-claimed.",
+    ],
+    parameters: TaskClaimParams,
+    executionMode: "sequential",
+    async execute(_id, params: TaskClaimArgs, _signal, _onUpdate, ctx) {
+      const id = taskId(params);
+      if (!id) throw new Error("taskId is required.");
+      const scope = taskStoreKey(ctx);
+      const result = taskStore.claimTask(scope, id, {
+        owner: params.owner,
+        start: params.start,
+        force: params.force,
+        oneOpenPerOwner: params.one_open_per_owner,
+      });
+      if (!result.success) {
+        const extras: string[] = [];
+        if (result.blockedByTasks?.length) extras.push(`blocked by ${result.blockedByTasks.map((bid) => `#${bid}`).join(", ")}`);
+        if (result.busyWithTasks?.length) extras.push(`owner busy with ${result.busyWithTasks.map((bid) => `#${bid}`).join(", ")}`);
+        const suffix = extras.length ? ` (${extras.join("; ")})` : "";
+        return textResult(`Claim failed for task #${id}: ${result.reason}${suffix}`, { claimed: false, ...result });
+      }
+      const claimedTask = result.task;
+      if (!claimedTask) return textResult(`Claim failed for task #${id}: task_not_found`, { claimed: false, reason: "task_not_found" });
+      onTaskChanged(ctx, TASK_UPDATED_EVENT, { taskId: id });
+      return textResult(`Claimed task #${id} for ${claimedTask.owner}${params.start ? " (in_progress)" : ""}`, { claimed: true, task: claimedTask });
     },
   });
 
@@ -911,8 +1007,9 @@ export function registerTaskTools(
     description: `Execute task(s) through pi-subagents. This is the only execution path for subagent tasks; do not separately call subagent for the same task.`,
     promptGuidelines: [
       "Only run pending ready tasks unless force=true is intentional.",
+      "Default to one task at a time. Use parallel=true for genuinely independent tasks, and async=true only for independent background work you do not need before proceeding.",
       "Foreground runs are preferred when the parent must inspect output and update state immediately.",
-      "Use async=true only for independent background work; do not poll or peek at async output unless the user asks or a completion notification arrives.",
+      "Do not poll or peek at async output unless the user asks or a completion notification arrives; trust detached runs until they complete.",
       "For context='fresh', the task prompt must be self-contained with paths, constraints, and proof expectations. For context='fork', avoid model overrides unless the tradeoff is explicit.",
       "Subagent output is not user-visible until the parent summarizes it; after TaskRun returns, report the result and evidence to the user.",
     ],

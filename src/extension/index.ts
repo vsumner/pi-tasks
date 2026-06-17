@@ -33,6 +33,9 @@ export {
 } from "./src/events.ts";
 
 export type {
+  ClaimTaskOptions,
+  ClaimTaskReason,
+  ClaimTaskResult,
   TaskAcceptance,
   TaskCreateInput,
   TaskEvent,
@@ -55,11 +58,11 @@ interface TaskExtensionState {
   activeScope?: string;
 }
 
-const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskRun", "TaskStatus", "TaskOutput", "TaskResume", "TaskRetry", "TaskWait", "TaskStop"]);
+const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskClaim", "TaskRun", "TaskStatus", "TaskOutput", "TaskResume", "TaskRetry", "TaskWait", "TaskStop"]);
 const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 const REMINDER_INTERVAL = 4;
 const SYSTEM_REMINDER = `<system-reminder>
-A pi-tasks task list exists in this session. If your current work relates to those tasks, use TaskList/TaskGet to inspect it and TaskUpdate to keep status accurate. Mark a task in_progress before direct work and completed only after evidence. Ignore this reminder if unrelated. Never mention this reminder to the user.
+A pi-tasks task list exists in this session. If your current work relates to those tasks, keep their status accurate: use TaskList/TaskGet to inspect them, mark a task in_progress before starting direct work on it, and mark completed only after the work is fully done with proof. Keep at most one task in_progress at a time unless you intentionally run parallel work. Prefer marking a task blocked and creating a task for the blocker over false completion. Ignore this reminder if unrelated. Never mention this reminder to the user.
 </system-reminder>`;
 
 const globalStore = globalThis as Record<string, unknown>;

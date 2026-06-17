@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { TASK_UPDATED_EVENT } from "./events.ts";
 import { formatTaskLine, statusIcon, taskStats, textBlock } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
 import type { TaskItem, TaskStatus } from "./task-state.ts";
@@ -16,12 +17,14 @@ import {
 
 class TaskListComponent {
   private tasks: TaskItem[];
+  private allTasks: TaskItem[];
   private theme: Theme;
   private onClose: () => void;
   private title: string;
 
-  constructor(tasks: TaskItem[], theme: Theme, onClose: () => void, title = "Tasks") {
+  constructor(tasks: TaskItem[], theme: Theme, onClose: () => void, title = "Tasks", allTasks: TaskItem[] = tasks) {
     this.tasks = tasks;
+    this.allTasks = allTasks;
     this.theme = theme;
     this.onClose = onClose;
     this.title = title;
@@ -50,9 +53,10 @@ class TaskListComponent {
           : task.status === "failed" ? th.fg("error", rawIcon)
           : task.status === "cancelled" ? th.fg("dim", rawIcon)
           : th.fg("muted", rawIcon);
+        const formatted = formatTaskLine(task, this.allTasks);
         const line = task.status === "completed"
-          ? `  ${icon} ${th.fg("dim", th.strikethrough(formatTaskLine(task)))}`
-          : `  ${icon} ${formatTaskLine(task)}`;
+          ? `  ${icon} ${th.fg("dim", th.strikethrough(formatted))}`
+          : `  ${icon} ${formatted}`;
         lines.push(truncateToWidth(line, width));
       }
     }
@@ -102,8 +106,8 @@ function notify(ctx: ExtensionContext, text: string, level: "info" | "warning" |
   return text;
 }
 
-function notifyList(ctx: ExtensionContext, tasks: TaskItem[], title = "Tasks"): string {
-  const text = tasks.length > 0 ? tasks.map(formatTaskLine).join("\n") : "No tasks on this branch.";
+function notifyList(ctx: ExtensionContext, tasks: TaskItem[], title = "Tasks", allTasks: TaskItem[] = tasks): string {
+  const text = tasks.length > 0 ? tasks.map((task) => formatTaskLine(task, allTasks)).join("\n") : "No tasks on this branch.";
   if (ctx.hasUI) ctx.ui.notify(`${title}:\n${text}`, "info");
   return text;
 }
@@ -128,7 +132,7 @@ export function registerTaskCommands(
   onTaskChanged: TaskChangeHandler = () => {},
 ): void {
   pi.registerCommand("tasks", {
-    description: "Manage pi-tasks. Args: list|ready|active|failed|run|status|output|stop|resume|retry|wait|snapshot|clear-completed|clear-all",
+    description: "Manage pi-tasks. Args: list|ready|active|failed|run|claim|status|output|stop|resume|retry|wait|snapshot|clear-completed|clear-all",
     handler: async (args, ctx) => {
       const raw = String(args ?? "").trim();
       const tokens = tokenize(raw);
@@ -233,18 +237,45 @@ export function registerTaskCommands(
         return;
       }
 
+      if (action === "claim") {
+        const id = tokens.find((token) => /^\d+$/.test(token));
+        if (!requireId(ctx, action, id)) return;
+        const idIndex = tokens.indexOf(id);
+        const afterId = tokens.slice(idIndex + 1);
+        const rawOwner = afterId.find((t) => !t.startsWith("-"));
+        const owner = rawOwner === undefined ? "user" : rawOwner.trim();
+        const start = flag(tokens, "--start");
+        const result = store.claimTask(scope, id, {
+          owner,
+          start,
+          force: flag(tokens, "--force"),
+          oneOpenPerOwner: flag(tokens, "--one-open-per-owner"),
+        });
+        refreshWidget(ctx);
+        if (result.success) {
+          onTaskChanged(ctx, TASK_UPDATED_EVENT, { taskId: id });
+          notify(ctx, `Claimed task #${id} for ${result.task?.owner ?? owner}${start ? " (in_progress)" : ""}.`);
+        } else {
+          const detail = result.blockedByTasks?.length ? ` (blocked by ${result.blockedByTasks.map((bid) => `#${bid}`).join(", ")})` : "";
+          const busy = result.busyWithTasks?.length ? ` (owner busy with ${result.busyWithTasks.map((bid) => `#${bid}`).join(", ")})` : "";
+          notify(ctx, `Claim failed for task #${id}: ${result.reason}${detail}${busy}`, "warning");
+        }
+        return;
+      }
+
       const statusFilter = statusFilterFor(action);
+      const allTasks = store.readAll(scope);
       const tasks = action === "ready"
         ? store.ready(scope)
         : statusFilter
-          ? store.readAll(scope).filter((task) => task.status === statusFilter)
-          : store.readAll(scope);
+          ? allTasks.filter((task) => task.status === statusFilter)
+          : allTasks;
       const title = action === "ready" ? "Ready tasks" : statusFilter ? `${action[0]?.toUpperCase() ?? ""}${action.slice(1)} tasks` : "Tasks";
       if (ctx.mode !== "tui") {
-        notifyList(ctx, tasks, title);
+        notifyList(ctx, tasks, title, allTasks);
         return;
       }
-      await ctx.ui.custom<void>((_tui, theme, _kb, done) => new TaskListComponent(tasks, theme, () => done(), title));
+      await ctx.ui.custom<void>((_tui, theme, _kb, done) => new TaskListComponent(tasks, theme, () => done(), title, allTasks));
       void tasks;
       return;
     },

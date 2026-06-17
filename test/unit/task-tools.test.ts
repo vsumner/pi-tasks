@@ -104,6 +104,22 @@ function seedInFlightTask(): string {
   return task.id;
 }
 
+function seedCompletedAsyncTaskWithOutput(): string {
+  const task = taskStore.createTask("session-1", { title: "Async done", prompt: "ran in background", cwd: "/repo" });
+  taskStore.startRun("session-1", task.id, makeRun(task.id, "detached"));
+  taskStore.finishRun("session-1", task.id, "completed", {
+    summary: "background complete",
+    output: "background complete",
+    subagent: {
+      asyncId: "async-1",
+      savedOutputs: ["/tmp/async-out.md"],
+      artifactOutputs: ["/tmp/artifact.md"],
+      sessionFiles: ["/tmp/session.jsonl"],
+    },
+  });
+  return task.id;
+}
+
 test("TaskCreate validates required fields and stores normalized task data", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
@@ -141,6 +157,40 @@ test("TaskCreate validates required fields and stores normalized task data", asy
   assert.equal(taskStore.readTask("session-1", "1")?.status, "pending");
 });
 
+test("TaskCreate appends an activeForm tip when activeForm is omitted", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskCreate").execute("call-1", {
+    subject: "Build thing",
+    description: "Implement the thing",
+  }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Task #1 created: Build thing/);
+  assert.match(result.content[0].text, /Tip: set activeForm/);
+  assert.equal(taskStore.readTask("session-1", "1")?.activeForm, undefined);
+  assert.equal(taskStore.readTask("session-1", "1")?.status, "pending");
+});
+
+test("TaskCreate omits the activeForm tip when activeForm is provided", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskCreate").execute("call-1", {
+    subject: "Build thing",
+    description: "Implement the thing",
+    activeForm: "Building thing",
+  }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Task #1 created: Build thing/);
+  assert.doesNotMatch(result.content[0].text, /Tip: set activeForm/);
+  assert.equal(taskStore.readTask("session-1", "1")?.activeForm, "Building thing");
+});
+
 test("TaskList filters ready tasks and stored statuses", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
@@ -164,6 +214,22 @@ test("TaskList filters ready tasks and stored statuses", async () => {
   assert.deepEqual(completedResult.details.tasks.map((task: { id: string }) => task.id), [done.id]);
 
   assert.equal(blocked.blockedBy[0], ready.id);
+});
+
+test("TaskList hides completed blockers from blockedBy summaries", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const blocker = taskStore.createTask("session-1", { title: "Blocker", prompt: "First", cwd: "/repo" });
+  const target = taskStore.createTask("session-1", { title: "Target", prompt: "Second", blockedBy: [blocker.id], cwd: "/repo" });
+  taskStore.updateStatus("session-1", blocker.id, "completed", "done");
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskList").execute("call-1", {}, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /#2 \[pending\] Target/);
+  assert.doesNotMatch(result.content[0].text, /#2 \[pending\] Target .*\[blocked by #1\]/);
+  assert.deepEqual(result.details.tasks.map((task: { id: string }) => task.id), [blocker.id, target.id]);
 });
 
 test("TaskGet returns details including dependency, evidence, and metadata", async () => {
@@ -213,6 +279,21 @@ test("TaskUpdate merges metadata, edits dependency edges, records notes, and del
   const deleted = await tools.get("TaskUpdate").execute("call-3", { taskId: target.id, status: "deleted" }, undefined, undefined, createCtx());
   assert.match(deleted.content[0].text, /Task #2 deleted/);
   assert.equal(taskStore.readTask("session-1", target.id), null);
+});
+
+test("TaskUpdate completion result nudges the agent to list newly ready work", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const blocker = taskStore.createTask("session-1", { title: "Blocker", prompt: "First", cwd: "/repo" });
+  const target = taskStore.createTask("session-1", { title: "Target", prompt: "Second", blockedBy: [blocker.id], cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskUpdate").execute("call-1", { taskId: blocker.id, status: "completed" }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Updated task #1: completed/);
+  assert.match(result.content[0].text, /Task completed\. Call TaskList now to find newly unblocked work\. Ready: #2\./);
+  assert.equal(taskStore.readTask("session-1", target.id)?.status, "pending");
 });
 
 test("TaskStop does not cancel a completed task when interrupt fails", async () => {
@@ -274,6 +355,74 @@ test("TaskOutput does not refresh completed foreground runIds as async ids", asy
   assert.equal(taskStore.readTask("session-1", id)?.run?.subagent.runId, "foreground-run-1");
 });
 
+test("TaskOutput leads with output file paths when a run saved outputs", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const id = seedCompletedAsyncTaskWithOutput();
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskOutput").execute("call-1", { taskId: id, refresh: false }, undefined, undefined, createCtx());
+  const text = result.content[0].text;
+
+  // Header line stays first.
+  assert.match(text, /^Task #1 \[completed\] Async done/);
+  // Output files section leads, ahead of Run output and Evidence.
+  const filesIdx = text.indexOf("## Output files");
+  const runIdx = text.indexOf("## Run output");
+  assert.ok(filesIdx > -1, "expected an Output files section");
+  assert.ok(filesIdx < runIdx, "Output files must precede Run output");
+  assert.match(text, /Saved output — read this file for the full result:\n  \/tmp\/async-out\.md/);
+  assert.match(text, /Artifact output:\n  \/tmp\/artifact\.md/);
+  assert.match(text, /Subagent session transcript \(reference only\):\n  \/tmp\/session\.jsonl/);
+  // Structured run metadata is preserved in details.
+  assert.equal(result.details.task.run.subagent.asyncId, "async-1");
+  assert.deepEqual(result.details.task.run.subagent.savedOutputs, ["/tmp/async-out.md"]);
+});
+
+test("TaskOutput omits the Output files section when no paths are recorded", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const id = seedCompletedTask();
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskOutput").execute("call-1", { taskId: id, refresh: false }, undefined, undefined, createCtx());
+
+  assert.doesNotMatch(result.content[0].text, /## Output files/);
+  assert.match(result.content[0].text, /## Run output/);
+});
+
+test("TaskOutput does not refresh completed async runs just because an asyncId exists", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const id = seedCompletedAsyncTaskWithOutput();
+  const { tools, events: bus } = createHarness();
+
+  const result = await tools.get("TaskOutput").execute("call-1", { taskId: id }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /## Output files/);
+  assert.equal(bus.requests.length, 0);
+  assert.equal(taskStore.readTask("session-1", id)?.status, "completed");
+});
+
+test("TaskRun async launch summary includes read-output guidance when paths exist", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const task = taskStore.createTask("session-1", { title: "Background", prompt: "run async", cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskRun").execute("call-1", { taskId: task.id, async: true }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /#1: detached/);
+  assert.match(result.content[0].text, /output saved to \/tmp\/out\.md; read it for the full result/);
+  const stored = taskStore.readTask("session-1", task.id);
+  assert.equal(stored?.run?.status, "detached");
+  assert.deepEqual(stored?.run?.subagent.savedOutputs, ["/tmp/out.md"]);
+});
+
 test("TaskRun foreground parallel maps ordered child results to tasks", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
@@ -325,7 +474,7 @@ test("TaskRun rejects async parallel instead of starting tasks", async () => {
   assert.equal(taskStore.readTask("session-1", second.id)?.status, "pending");
 });
 
-test("TaskRun ready=true selects ready tasks", async () => {
+test("TaskRun ready=true selects ready tasks and nudges toward newly ready work", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
   taskStore.setEventAppender((event) => events.push(event));
@@ -336,6 +485,7 @@ test("TaskRun ready=true selects ready tasks", async () => {
   const result = await tools.get("TaskRun").execute("call-1", { ready: true }, undefined, undefined, createCtx());
 
   assert.match(result.content[0].text, /#1: completed/);
+  assert.match(result.content[0].text, /Task completed\. Call TaskList now to find newly unblocked work\. Ready: #2\./);
   assert.equal(taskStore.readTask("session-1", first.id)?.status, "completed");
   assert.equal(taskStore.readTask("session-1", second.id)?.status, "pending");
 });
@@ -459,4 +609,122 @@ test("TaskWait timeout reports unrecognized async status state", async () => {
   assert.match(result.content[0].text, /Unrecognized pi-subagents status state "done"; task remains in_progress/);
   assert.equal(result.details.timedOut, true);
   assert.equal(taskStore.readTask("session-1", id)?.status, "in_progress");
+});
+
+test("TaskClaim succeeds for an unowned pending task", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const task = taskStore.createTask("session-1", { title: "Claim me", prompt: "Work", cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: task.id, owner: "  alice  " }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claimed task #1 for alice/);
+  assert.equal(result.details.claimed, true);
+  assert.equal(taskStore.readTask("session-1", task.id)?.owner, "alice");
+  assert.equal(taskStore.readTask("session-1", task.id)?.status, "pending");
+});
+
+test("TaskClaim reports invalid_owner for blank owners without mutating", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const task = taskStore.createTask("session-1", { title: "Claim me", prompt: "Work", cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: task.id, owner: "   " }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claim failed for task #1: invalid_owner/);
+  assert.equal(result.details.claimed, false);
+  assert.equal(result.details.reason, "invalid_owner");
+  assert.equal(taskStore.readTask("session-1", task.id)?.owner, undefined);
+});
+
+test("TaskClaim with start sets status to in_progress", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const task = taskStore.createTask("session-1", { title: "Claim me", prompt: "Work", cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: task.id, owner: "alice", start: true }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claimed task #1 for alice \(in_progress\)/);
+  assert.equal(taskStore.readTask("session-1", task.id)?.status, "in_progress");
+});
+
+test("TaskClaim reports structured failure for an already-owned task", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const task = taskStore.createTask("session-1", { title: "Owned", prompt: "Work", owner: "bob", cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: task.id, owner: "alice" }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claim failed for task #1: already_claimed/);
+  assert.equal(result.details.claimed, false);
+  assert.equal(result.details.reason, "already_claimed");
+  assert.equal(taskStore.readTask("session-1", task.id)?.owner, "bob");
+});
+
+test("TaskClaim force overrides already_claimed", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const task = taskStore.createTask("session-1", { title: "Owned", prompt: "Work", owner: "bob", cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: task.id, owner: "alice", force: true }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claimed task #1 for alice/);
+  assert.equal(taskStore.readTask("session-1", task.id)?.owner, "alice");
+});
+
+test("TaskClaim reports blocked with dependency ids", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const blocker = taskStore.createTask("session-1", { title: "Blocker", prompt: "First", cwd: "/repo" });
+  const target = taskStore.createTask("session-1", { title: "Target", prompt: "Second", blockedBy: [blocker.id], cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: target.id, owner: "alice" }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claim failed for task #2: blocked/);
+  assert.match(result.content[0].text, /blocked by #1/);
+  assert.equal(result.details.reason, "blocked");
+  assert.deepEqual(result.details.blockedByTasks, [blocker.id]);
+});
+
+test("TaskClaim reports owner_busy with open task ids", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const open = taskStore.createTask("session-1", { title: "Open", prompt: "In progress", cwd: "/repo" });
+  taskStore.claimTask("session-1", open.id, { owner: "alice", start: true });
+  const target = taskStore.createTask("session-1", { title: "Target", prompt: "Claim me", cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: target.id, owner: "alice", one_open_per_owner: true }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claim failed for task #2: owner_busy/);
+  assert.match(result.content[0].text, /owner busy with #1/);
+  assert.equal(result.details.reason, "owner_busy");
+  assert.deepEqual(result.details.busyWithTasks, [open.id]);
+});
+
+test("TaskClaim reports already_terminal for a completed task", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const id = seedCompletedTask();
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskClaim").execute("call-1", { taskId: id, owner: "alice" }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Claim failed for task #1: already_terminal/);
+  assert.equal(result.details.reason, "already_terminal");
+  assert.equal(taskStore.readTask("session-1", id)?.status, "completed");
 });

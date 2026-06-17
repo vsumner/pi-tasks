@@ -19,12 +19,16 @@ import {
   clone,
   compareTasks,
   createTask as createTaskState,
+  evaluateClaim,
   makeEvidence,
   mergeMetadata,
   normalizeKind,
   normalizeStatus,
   readyTasks,
   stringArray,
+  type ClaimTaskOptions,
+  type ClaimTaskReason,
+  type ClaimTaskResult,
   type TaskAcceptance,
   type TaskCreateInput,
   type TaskEvent,
@@ -39,6 +43,9 @@ import {
 } from "./task-state.ts";
 
 export type {
+  ClaimTaskOptions,
+  ClaimTaskReason,
+  ClaimTaskResult,
   TaskAcceptance,
   TaskCreateInput,
   TaskEvent,
@@ -60,6 +67,7 @@ export interface TaskUpdateInput extends TaskPatch {
 }
 
 const tasksByCwd = new Map<string, Map<string, TaskItem>>();
+const highWaterIdsByCwd = new Map<string, number>();
 let eventAppender: ((event: TaskEvent) => void) | undefined;
 let appendSuppressionDepth = 0;
 
@@ -86,19 +94,51 @@ function appendEvent(event: TaskEvent): void {
   eventAppender(event);
 }
 
+function numericTaskId(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+}
+
+function updateHighWater(cwd: string, id: unknown): void {
+  const n = numericTaskId(id);
+  if (!n) return;
+  highWaterIdsByCwd.set(cwd, Math.max(highWaterIdsByCwd.get(cwd) ?? 0, n));
+}
+
+function highWaterFromEvent(event: TaskEvent): number | undefined {
+  const data = event.data ?? {};
+  if (typeof data.version === "number" && data.version > TASK_EVENT_VERSION) return undefined;
+  const ids: unknown[] = [data.highWaterId, data.taskId, (data.task as { id?: unknown } | undefined)?.id];
+  if (Array.isArray(data.tasks)) {
+    for (const task of data.tasks) ids.push((task as { id?: unknown } | undefined)?.id);
+  }
+  const numeric = ids.map(numericTaskId).filter((id): id is number => typeof id === "number");
+  return numeric.length > 0 ? Math.max(...numeric) : undefined;
+}
+
+function updateHighWaterFromEvent(cwd: string, event: TaskEvent): void {
+  updateHighWater(cwd, String(highWaterFromEvent(event) ?? ""));
+}
+
+function currentHighWater(cwd: string): number {
+  let max = highWaterIdsByCwd.get(cwd) ?? 0;
+  for (const id of getCwdMap(cwd).keys()) {
+    max = Math.max(max, numericTaskId(id) ?? 0);
+  }
+  highWaterIdsByCwd.set(cwd, max);
+  return max;
+}
+
 function emit(cwd: string, event: TaskEvent): void {
   const scopedEvent = { ...event, scope: cwd };
   appendEvent(scopedEvent);
+  updateHighWaterFromEvent(cwd, scopedEvent);
   tasksByCwd.set(cwd, applyTaskEventToMap(getCwdMap(cwd), scopedEvent));
 }
 
 function nextId(cwd: string): string {
-  let max = 0;
-  for (const id of getCwdMap(cwd).keys()) {
-    const n = Number(id);
-    if (Number.isSafeInteger(n) && n > max) max = n;
-  }
-  return String(max + 1);
+  return String(currentHighWater(cwd) + 1);
 }
 
 function getTaskOrThrow(cwd: string, taskId: string): TaskItem {
@@ -193,6 +233,7 @@ export const taskStore = {
 
   reset(): void {
     tasksByCwd.clear();
+    highWaterIdsByCwd.clear();
     eventAppender = undefined;
     appendSuppressionDepth = 0;
   },
@@ -208,8 +249,13 @@ export const taskStore = {
 
   applyEvents(cwd: string, events: TaskEvent[]): void {
     let projected = new Map<string, TaskItem>();
-    for (const event of events) projected = applyTaskEventToMap(projected, event);
+    let highWater = 0;
+    for (const event of events) {
+      projected = applyTaskEventToMap(projected, event);
+      highWater = Math.max(highWater, highWaterFromEvent(event) ?? 0);
+    }
     tasksByCwd.set(cwd, projected);
+    highWaterIdsByCwd.set(cwd, Math.max(highWater, ...Array.from(projected.keys(), (id) => numericTaskId(id) ?? 0)));
   },
 
   createTask(cwd: string, input: TaskCreateInput): TaskItem {
@@ -253,6 +299,20 @@ export const taskStore = {
     return getTaskOrThrow(cwd, taskId);
   },
 
+  claimTask(cwd: string, taskId: string, options: ClaimTaskOptions): ClaimTaskResult {
+    const map = getCwdMap(cwd);
+    const task = map.get(taskId) ?? null;
+    const normalizedOptions = { ...options, owner: options.owner.trim() };
+    const result = evaluateClaim(task, map.values(), normalizedOptions);
+    if (!result.success || !result.task) return result;
+
+    emitTaskSnapshot(cwd, applyUpdate(getTaskOrThrow(cwd, taskId), {
+      owner: normalizedOptions.owner,
+      ...(normalizedOptions.start ? { status: "in_progress" as TaskStatus } : {}),
+    }));
+    return { success: true, task: getTaskOrThrow(cwd, taskId) };
+  },
+
   deleteTask(cwd: string, taskId: string): void {
     getTaskOrThrow(cwd, taskId);
     emit(cwd, makeEvent(TASK_DELETED_EVENT, { taskId }));
@@ -272,7 +332,7 @@ export const taskStore = {
 
   snapshot(cwd: string): number {
     const tasks = Array.from(getCwdMap(cwd).values()).map(clone).sort(compareTasks);
-    emit(cwd, makeEvent(TASK_SNAPSHOT_EVENT, { tasks }));
+    emit(cwd, makeEvent(TASK_SNAPSHOT_EVENT, { tasks, highWaterId: String(currentHighWater(cwd)) }));
     return tasks.length;
   },
 
