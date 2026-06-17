@@ -383,6 +383,19 @@ export function unresolvedBlockers(task: TaskItem, allTasks?: TaskItem[] | Itera
   return unresolvedBlockersById(task, indexById(allTasks));
 }
 
+/**
+ * Dependency ids that reference no known task. Used at write time (create /
+ * update) to reject dangling blockedBy/blocks references early: a dependency
+ * on a non-existent task is almost always a typo or a forward reference to a
+ * not-yet-created id, and silently accepting it strands the task —
+ * isTaskBlockedById treats a missing blocker as permanently unresolved.
+ * Returns ids in first-seen order, deduped.
+ */
+export function unknownDependencyIds(ids: Iterable<string>, knownIds: Iterable<string>): string[] {
+  const known = new Set(knownIds);
+  return Array.from(new Set(ids)).filter((id) => !known.has(id));
+}
+
 export function compareTasks(a: TaskItem, b: TaskItem): number {
   const numeric = Number(a.id) - Number(b.id);
   if (Number.isFinite(numeric) && numeric !== 0) return numeric;

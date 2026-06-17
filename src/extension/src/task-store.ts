@@ -25,6 +25,7 @@ import {
   normalizeStatus,
   readyTasks,
   stringArray,
+  unknownDependencyIds,
   type ClaimTaskOptions,
   type ClaimTaskReason,
   type ClaimTaskResult,
@@ -259,6 +260,23 @@ export class TaskStore {
     return this.getTaskOrThrow(cwd, task.id);
   }
 
+  /**
+   * Reject blockedBy/blocks references to ids that have no task in this scope.
+   * Called before any emit so create/update stay atomic: a dangling ref
+   * (typo or forward reference to a not-yet-created id) throws instead of
+   * stranding the task as permanently blocked. Event replay and existing
+   * dangling tasks are intentionally not re-validated.
+   */
+  private assertDependenciesKnown(cwd: string, ...idLists: string[][]): void {
+    const unknown = unknownDependencyIds(idLists.flat(), this.getCwdMap(cwd).keys());
+    if (unknown.length > 0) {
+      throw new Error(
+        `Task references unknown dependency id(s): ${unknown.map((id) => `#${id}`).join(", ")}. ` +
+          `Create the referenced task(s) first, or check IDs with TaskList.`,
+      );
+    }
+  }
+
   setEventAppender(appender: (event: TaskEvent) => void): void {
     this.eventAppender = appender;
   }
@@ -342,6 +360,7 @@ export class TaskStore {
     if (!input.prompt.trim()) throw new Error("Task prompt is required.");
     const task = createTaskState(input, input.id ?? this.nextId(cwd));
     if (this.getCwdMap(cwd).has(task.id)) throw new Error(`Task #${task.id} already exists.`);
+    this.assertDependenciesKnown(cwd, task.blockedBy, task.blocks);
     this.emit(cwd, makeEvent(TASK_CREATED_EVENT, { taskId: task.id, task }));
     for (const other of this.reciprocalUpdates(cwd, task)) this.emitTaskSnapshot(cwd, other);
     return this.getTaskOrThrow(cwd, task.id);
@@ -363,6 +382,7 @@ export class TaskStore {
   updateTask(cwd: string, taskId: string, update: TaskUpdateInput): TaskItem {
     const before = this.getTaskOrThrow(cwd, taskId);
     const after = applyUpdate(before, update);
+    this.assertDependenciesKnown(cwd, after.blockedBy, after.blocks);
     this.emitTaskSnapshot(cwd, after);
     for (const other of this.reciprocalUpdates(cwd, after, before)) this.emitTaskSnapshot(cwd, other);
     return this.getTaskOrThrow(cwd, taskId);

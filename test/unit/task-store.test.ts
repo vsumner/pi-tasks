@@ -284,3 +284,58 @@ test("taskStore.claimTask preserves existing TaskUpdate owner behavior", () => {
   assert.equal(claimResult.reason, "already_claimed");
   assert.equal(taskStore.readTask("/repo", task.id)?.owner, "bob");
 });
+
+test("taskStore.createTask rejects unknown blockedBy references", () => {
+  taskStore.reset();
+  const events: TaskEvent[] = [];
+  taskStore.setEventAppender((event) => events.push(event));
+
+  assert.throws(
+    () => taskStore.createTask("/repo", { title: "Orphan", prompt: "x", blockedBy: ["99"] }),
+    /unknown dependency id/i,
+  );
+  // Nothing was emitted: the throw happened before any state change.
+  assert.equal(events.length, 0);
+  assert.equal(taskStore.readAll("/repo").length, 0);
+});
+
+test("taskStore.createTask rejects unknown blocks references", () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+
+  assert.throws(
+    () => taskStore.createTask("/repo", { title: "Orphan", prompt: "x", blocks: ["42"] }),
+    /#42/,
+  );
+});
+
+test("taskStore.updateTask rejects unknown addBlockedBy references", () => {
+  taskStore.reset();
+  const events: TaskEvent[] = [];
+  taskStore.setEventAppender((event) => events.push(event));
+
+  const task = taskStore.createTask("/repo", { title: "Real", prompt: "x" });
+  assert.throws(
+    () => taskStore.updateTask("/repo", task.id, { addBlockedBy: ["77"] }),
+    /unknown dependency id/i,
+  );
+  // The update threw before emitting, so the task is unchanged.
+  assert.deepEqual(taskStore.readTask("/repo", task.id)?.blockedBy, []);
+});
+
+test("taskStore accepts valid dependency references and still writes reciprocal edges", () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+
+  const a = taskStore.createTask("/repo", { title: "A", prompt: "x" });
+  const b = taskStore.createTask("/repo", { title: "B", prompt: "x", blockedBy: [a.id] });
+  // Existing forward-ref behavior is preserved.
+  assert.deepEqual(taskStore.readTask("/repo", b.id)?.blockedBy, [a.id]);
+  assert.deepEqual(taskStore.readTask("/repo", a.id)?.blocks, [b.id]);
+
+  // updateTask with a valid new dependency still works.
+  const c = taskStore.createTask("/repo", { title: "C", prompt: "x" });
+  taskStore.updateTask("/repo", b.id, { addBlockedBy: [c.id] });
+  assert.deepEqual(taskStore.readTask("/repo", b.id)?.blockedBy, [a.id, c.id]);
+  assert.deepEqual(taskStore.readTask("/repo", c.id)?.blocks, [b.id]);
+});
