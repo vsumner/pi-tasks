@@ -15,14 +15,13 @@ import {
   TASK_UPDATED_EVENT,
 } from "./events.ts";
 import {
+  applyPatch,
   applyTaskEventToMap,
   clone,
   compareTasks,
   createTask as createTaskState,
   evaluateClaim,
   makeEvidence,
-  mergeMetadata,
-  normalizeKind,
   normalizeStatus,
   readyTasks,
   stringArray,
@@ -153,36 +152,47 @@ function getTaskOrThrow(cwd: string, taskId: string): TaskItem {
   return clone(task);
 }
 
-function applyUpdate(task: TaskItem, update: TaskUpdateInput): TaskItem {
-  const next = clone(task);
-  if (typeof update.title === "string") next.title = update.title.trim();
-  if (typeof update.prompt === "string") next.prompt = update.prompt.trim();
-  if (update.status !== undefined) next.status = normalizeStatus(update.status, next.status);
-  if (update.kind !== undefined) next.kind = normalizeKind(update.kind, next.kind);
-  if (update.activeForm !== undefined) next.activeForm = update.activeForm?.trim() || undefined;
-  if (update.agent !== undefined) next.agent = update.agent?.trim() || undefined;
-  if (update.owner !== undefined) next.owner = update.owner?.trim() || undefined;
-  if (update.source !== undefined) next.source = String(update.source || "agent");
-  if (update.cwd !== undefined) next.cwd = update.cwd;
-  if (update.acceptance !== undefined) next.acceptance = update.acceptance as TaskAcceptance | undefined;
-  if (update.metadata !== undefined) next.metadata = mergeMetadata(next.metadata, update.metadata);
-
-  if (update.blockedBy !== undefined) next.blockedBy = stringArray(update.blockedBy);
-  if (update.blocks !== undefined) next.blocks = stringArray(update.blocks);
-
-  for (const id of stringArray(update.addBlockedBy)) {
-    if (!next.blockedBy.includes(id)) next.blockedBy.push(id);
+/**
+ * Combine replace/add/remove dependency deltas into a final array. Returns
+ * undefined when no dependency field was supplied, so the caller can skip the
+ * field entirely (preserving the existing value instead of clobbering it).
+ */
+function resolveDependencyList(
+  current: string[],
+  replace: string[] | undefined,
+  add: string[] | undefined,
+  remove: string[] | undefined,
+): string[] | undefined {
+  if (replace === undefined && add === undefined && remove === undefined) return undefined;
+  let next = replace !== undefined ? [...stringArray(replace)] : [...current];
+  for (const id of stringArray(add)) {
+    if (!next.includes(id)) next.push(id);
   }
-  for (const id of stringArray(update.addBlocks)) {
-    if (!next.blocks.includes(id)) next.blocks.push(id);
-  }
-  const removeBlockedBy = new Set(stringArray(update.removeBlockedBy));
-  if (removeBlockedBy.size > 0) next.blockedBy = next.blockedBy.filter((id) => !removeBlockedBy.has(id));
-  const removeBlocks = new Set(stringArray(update.removeBlocks));
-  if (removeBlocks.size > 0) next.blocks = next.blocks.filter((id) => !removeBlocks.has(id));
-
-  next.updatedAt = now();
+  const removeSet = new Set(stringArray(remove));
+  if (removeSet.size > 0) next = next.filter((id) => !removeSet.has(id));
   return next;
+}
+
+function applyUpdate(task: TaskItem, update: TaskUpdateInput): TaskItem {
+  // Field normalization is delegated to applyPatch (single source of truth,
+  // shared with the event-sourced projection). Only the add/remove dependency
+  // delta logic is resolved here, then handed to applyPatch as a flat patch.
+  const patch: TaskPatch = {
+    title: update.title,
+    prompt: update.prompt,
+    status: update.status,
+    kind: update.kind,
+    activeForm: update.activeForm,
+    agent: update.agent,
+    owner: update.owner,
+    source: update.source,
+    cwd: update.cwd,
+    acceptance: update.acceptance as TaskAcceptance | undefined,
+    metadata: update.metadata,
+    blockedBy: resolveDependencyList(task.blockedBy, update.blockedBy, update.addBlockedBy, update.removeBlockedBy),
+    blocks: resolveDependencyList(task.blocks, update.blocks, update.addBlocks, update.removeBlocks),
+  };
+  return applyPatch(task, patch, now());
 }
 
 function reciprocalUpdates(cwd: string, task: TaskItem, before?: TaskItem): TaskItem[] {
@@ -387,6 +397,36 @@ export const taskStore = {
     getTaskOrThrow(cwd, taskId);
     emit(cwd, makeEvent(TASK_RUN_FINISHED_EVENT, { taskId, status, ...opts }));
     return getTaskOrThrow(cwd, taskId);
+  },
+
+  /**
+   * Atomically finish a run and record a status-appropriate evidence entry.
+   * Centralizes the finishRun + recordEvidence pair and the run-status →
+   * evidence-kind mapping (failed→error, cancelled→note, else→output) that
+   * was duplicated across every TaskRun/TaskRetry/TaskOutput/async-complete
+   * call site. Returns the latest task projection.
+   */
+  completeRun(
+    cwd: string,
+    taskId: string,
+    status: TaskRunStatus,
+    opts: {
+      summary: string;
+      error?: string;
+      usage?: TaskRunRecord["usage"];
+      subagent?: Partial<TaskSubagentRef>;
+      evidenceMetadata?: Record<string, unknown>;
+    },
+  ): TaskItem {
+    this.finishRun(cwd, taskId, status, {
+      summary: opts.summary,
+      output: opts.summary,
+      error: opts.error,
+      usage: opts.usage,
+      subagent: opts.subagent,
+    });
+    const kind = status === "failed" ? "error" : status === "cancelled" ? "note" : "output";
+    return this.recordEvidence(cwd, taskId, makeEvidence(kind, opts.summary, opts.evidenceMetadata));
   },
 
   recordEvidence(cwd: string, taskId: string, evidence: TaskEvidence): TaskItem {

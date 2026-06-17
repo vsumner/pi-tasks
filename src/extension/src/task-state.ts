@@ -346,7 +346,7 @@ export function createTask(input: TaskCreateInput, id: string): TaskItem {
 export function isTaskBlocked(task: TaskItem, tasks: Iterable<TaskItem>): boolean {
   if (task.status !== "pending") return true;
   if (task.blockedBy.length === 0) return false;
-  const byId = new Map(Array.from(tasks, (t) => [t.id, t] as const));
+  const byId = indexById(tasks);
   return task.blockedBy.some((id) => byId.get(id)?.status !== "completed");
 }
 
@@ -361,6 +361,11 @@ export function compareTasks(a: TaskItem, b: TaskItem): number {
   const numeric = Number(a.id) - Number(b.id);
   if (Number.isFinite(numeric) && numeric !== 0) return numeric;
   return a.id.localeCompare(b.id);
+}
+
+/** Index a task collection by id. Shared by blocker resolution, claim checks, and rendering. */
+export function indexById<T extends { id: string }>(tasks: Iterable<T>): Map<string, T> {
+  return new Map(Array.from(tasks, (t) => [t.id, t] as const));
 }
 
 /**
@@ -379,12 +384,12 @@ export function filterVisible(tasks: Iterable<TaskItem>): TaskItem[] {
   return Array.from(tasks).filter((task) => !isInternal(task));
 }
 
-function applyPatch(task: TaskItem, patch: TaskPatch, ts: string): TaskItem {
+export function applyPatch(task: TaskItem, patch: TaskPatch, ts: string): TaskItem {
   const next = clone(task);
   if (typeof patch.title === "string") next.title = patch.title.trim();
   if (typeof patch.prompt === "string") next.prompt = patch.prompt.trim();
   if (patch.status !== undefined) next.status = normalizeStatus(patch.status, next.status);
-  if (patch.kind !== undefined) next.kind = normalizeKind(patch.kind);
+  if (patch.kind !== undefined) next.kind = normalizeKind(patch.kind, next.kind);
   if (patch.activeForm !== undefined) next.activeForm = patch.activeForm?.trim() || undefined;
   if (patch.agent !== undefined) next.agent = patch.agent?.trim() || undefined;
   if (patch.owner !== undefined) next.owner = patch.owner?.trim() || undefined;
@@ -662,7 +667,7 @@ export function evaluateClaim(
   }
 
   const all = Array.from(tasks);
-  const byId = new Map(all.map((t) => [t.id, t] as const));
+  const byId = indexById(all);
   const blockedByTasks = task.blockedBy.filter((id) => byId.get(id)?.status !== "completed");
   if (blockedByTasks.length > 0) {
     return { success: false, reason: "blocked", task, blockedByTasks };

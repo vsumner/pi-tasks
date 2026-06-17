@@ -1,4 +1,4 @@
-import type { TaskItem, TaskStatus, TaskSubagentRef } from "./task-state.ts";
+import { indexById, type TaskItem, type TaskStatus, type TaskSubagentRef } from "./task-state.ts";
 
 export function statusIcon(status: TaskStatus): string {
   switch (status) {
@@ -35,8 +35,8 @@ export function formatDuration(ms: number): string {
 
 export function unresolvedBlockers(task: TaskItem, allTasks?: TaskItem[]): string[] {
   if (!allTasks) return [...task.blockedBy];
-  const byId = new Map(allTasks.map((item) => [item.id, item.status] as const));
-  return task.blockedBy.filter((id) => byId.get(id) !== "completed");
+  const byId = indexById(allTasks);
+  return task.blockedBy.filter((id) => byId.get(id)?.status !== "completed");
 }
 
 export function formatTaskLine(task: TaskItem, allTasks?: TaskItem[]): string {

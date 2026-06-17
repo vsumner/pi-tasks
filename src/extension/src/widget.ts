@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatDuration, primarySavedOutput, runOutputPaths, statusIcon, taskStats } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
-import { filterVisible, isTaskBlocked, readyTasks, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
+import { filterVisible, indexById, isTaskBlocked, readyTasks, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
 
 export interface TaskWidgetRuntime {
   latestCtx: ExtensionContext | null;
@@ -114,7 +114,7 @@ function iconFor(task: TaskItem, theme: Theme, frame: number): string {
   return theme.fg("muted", statusIcon(task.status));
 }
 
-function renderTask(task: TaskItem, all: TaskItem[], theme: Theme, frame: number, width: number, activity?: TaskActivity, nowMs: number = Date.now()): string {
+function renderTask(task: TaskItem, statusById: Map<string, TaskItem>, theme: Theme, frame: number, width: number, activity?: TaskActivity, nowMs: number = Date.now()): string {
   const icon = iconFor(task, theme, frame);
   const id = theme.fg("dim", `#${task.id}`);
   const title = task.status === "completed"
@@ -123,7 +123,7 @@ function renderTask(task: TaskItem, all: TaskItem[], theme: Theme, frame: number
       ? theme.fg("accent", `${task.activeForm ?? task.title}…`)
       : task.title;
 
-  const openBlockers = task.blockedBy.filter((id) => all.find((candidate) => candidate.id === id)?.status !== "completed");
+  const openBlockers = task.blockedBy.filter((id) => statusById.get(id)?.status !== "completed");
   const blocked = openBlockers.length > 0
     ? theme.fg("dim", ` › blocked by ${openBlockers.map((id) => `#${id}`).join(", ")}`)
     : "";
@@ -233,11 +233,14 @@ export function renderLines(tasks: TaskItem[], theme: Theme, frame: number, widt
   const ready = readyTasks(tasks);
   const readyCount = ready.length;
   const failedCount = tasks.filter((task) => task.status === "failed").length;
+  // Build the status index once per frame instead of a fresh O(n) all.find()
+  // scan per blocker per task on every 150ms repaint tick.
+  const statusById = indexById(tasks);
   const headerBits = [taskStats(tasks)];
   if (readyCount) headerBits.push(`${readyCount} ready`);
   if (failedCount) headerBits.push(`${failedCount} failed`);
   const header = truncateToWidth(`${theme.fg("accent", "●")} ${theme.fg("accent", headerBits.join(" · "))}`, maxW);
-  const lines = [header, ...plan.visible.flatMap((task) => renderTask(task, tasks, theme, frame, maxW, activityByTaskId?.get(task.id), nowMs).split("\n"))];
+  const lines = [header, ...plan.visible.flatMap((task) => renderTask(task, statusById, theme, frame, maxW, activityByTaskId?.get(task.id), nowMs).split("\n"))];
   if (plan.hidden.length > 0) {
     lines.push(truncateToWidth(theme.fg("dim", `    … and ${plan.hidden.length} more (${hiddenSummary(plan.hidden)})`), maxW));
   }

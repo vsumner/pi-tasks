@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { taskStore } from "./src/task-store.ts";
 import { getBranchTaskEvents } from "./src/task-projection.ts";
 import { taskStoreKey } from "./src/session-key.ts";
-import { makeEvidence, type TaskActivity, type TaskItem, type TaskRunStatus, type TaskSubagentRef } from "./src/task-state.ts";
+import { type TaskActivity, type TaskItem, type TaskRunStatus, type TaskSubagentRef } from "./src/task-state.ts";
 import { registerTaskTools } from "./src/task-tools.ts";
 import { registerTaskCommands } from "./src/task-commands.ts";
 import { createTaskWidget, type TaskWidgetRuntime } from "./src/widget.ts";
@@ -291,20 +291,16 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
       for (const task of taskStore.readAll(scope)) {
         if (!taskMatchesAsyncCompletion(task, ids)) continue;
         if (task.status !== "in_progress") continue;
-        const applyCompletion = () => {
-          const finished = taskStore.finishRun(scope, task.id, status, {
-            summary,
-            output: summary,
-            error: status === "failed" || status === "cancelled" ? summary : undefined,
-            subagent: task.run ? asyncSubagentRef(data, task.run.subagent) : undefined,
-          });
-          taskStore.recordEvidence(scope, task.id, makeEvidence(status === "failed" ? "error" : status === "cancelled" ? "note" : "output", summary, {
+        const applyCompletion = () => taskStore.completeRun(scope, task.id, status, {
+          summary,
+          error: status === "failed" || status === "cancelled" ? summary : undefined,
+          subagent: task.run ? asyncSubagentRef(data, task.run.subagent) : undefined,
+          evidenceMetadata: {
             source: SUBAGENT_ASYNC_COMPLETE_EVENT,
             asyncId: stringField(data, "id") ?? stringField(data, "asyncId"),
             runId: stringField(data, "runId"),
-          }));
-          return finished;
-        };
+          },
+        });
         const shouldPersist = !state.activeScope || state.activeScope === scope;
         const updated = shouldPersist ? applyCompletion() : taskStore.withoutAppending(applyCompletion);
         emitTaskEvent(pi, TASK_RUN_FINISHED_EVENT, { taskId: updated.id, status, async: true });

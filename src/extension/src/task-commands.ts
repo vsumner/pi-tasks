@@ -13,7 +13,7 @@ import {
   stopTask,
   waitForTask,
   type TaskChangeHandler,
-} from "./task-tools.ts";
+} from "./task-run-engine.ts";
 
 class TaskListComponent {
   private tasks: TaskItem[];

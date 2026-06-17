@@ -28,8 +28,10 @@ Run both before review.
 | `src/extension/src/format.ts` | Shared task/status/output formatting helpers. |
 | `src/extension/src/session-key.ts` | Session-scoped task-store key helper. |
 | `src/extension/src/task-state.ts` | Public task types and pure reducer/projection helpers. |
-| `src/extension/src/task-store.ts` | Session-backed projection cache and mutation API. |
-| `src/extension/src/task-tools.ts` | LLM tools: `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskClaim`, `TaskRun`, `TaskStatus`, `TaskOutput`, `TaskResume`, `TaskRetry`, `TaskWait`, `TaskStop`. |
+| `src/extension/src/task-store.ts` | Session-backed projection cache and mutation API (incl. `completeRun`). |
+| `src/extension/src/task-schemas.ts` | TypeBox parameter schemas, inferred arg types, and pure tool I/O helpers (`taskId`, `textResult`, `sortedTasks`, `taskDetails`). |
+| `src/extension/src/task-run-engine.ts` | Run lifecycle orchestration: `runTasks`, `getTaskStatus`, `getTaskOutput`, `stopTask`, `resumeTask`, `retryTask`, `waitForTask`, async refresh, and shared close-out hints. |
+| `src/extension/src/task-tools.ts` | Thin registration layer: wires the 12 `Task*` LLM tools to the schemas + run engine. |
 | `src/extension/src/subagents.ts` | Event bridge to `pi-subagents`; no orchestration logic elsewhere. |
 | `src/extension/src/widget.ts` | Claude-like task status widget. |
 | `src/extension/src/task-commands.ts` | `/tasks` command UI. |
