@@ -104,6 +104,117 @@ function seedInFlightTask(): string {
   return task.id;
 }
 
+test("TaskCreate validates required fields and stores normalized task data", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const { tools } = createHarness();
+
+  await assert.rejects(
+    tools.get("TaskCreate").execute("call-1", { subject: "   ", description: "Do work" }, undefined, undefined, createCtx()),
+    /Task title is required/,
+  );
+  await assert.rejects(
+    tools.get("TaskCreate").execute("call-2", { subject: "Build", description: "   " }, undefined, undefined, createCtx()),
+    /Task prompt is required/,
+  );
+
+  const result = await tools.get("TaskCreate").execute("call-3", {
+    subject: "  Build thing  ",
+    description: "  Implement the thing  ",
+    activeForm: "  Building thing  ",
+    agent: "  worker  ",
+    kind: "packet",
+    source: "pi-goals",
+    metadata: { goalId: "goal-1" },
+  }, undefined, undefined, createCtx());
+
+  const task = result.details.task;
+  assert.match(result.content[0].text, /Task #1 created: Build thing/);
+  assert.equal(task.title, "Build thing");
+  assert.equal(task.prompt, "Implement the thing");
+  assert.equal(task.activeForm, "Building thing");
+  assert.equal(task.agent, "worker");
+  assert.equal(task.kind, "packet");
+  assert.equal(task.source, "pi-goals");
+  assert.deepEqual(task.metadata, { goalId: "goal-1" });
+  assert.equal(taskStore.readTask("session-1", "1")?.status, "pending");
+});
+
+test("TaskList filters ready tasks and stored statuses", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const ready = taskStore.createTask("session-1", { title: "Ready", prompt: "Can run", cwd: "/repo" });
+  const blocked = taskStore.createTask("session-1", { title: "Blocked", prompt: "Wait", blockedBy: [ready.id], cwd: "/repo" });
+  const done = taskStore.createTask("session-1", { title: "Done", prompt: "Finished", cwd: "/repo" });
+  taskStore.startRun("session-1", done.id, makeRun(done.id));
+  taskStore.finishRun("session-1", done.id, "completed", { summary: "done" });
+  const { tools } = createHarness();
+
+  const readyResult = await tools.get("TaskList").execute("call-1", { ready_only: true }, undefined, undefined, createCtx());
+  assert.match(readyResult.content[0].text, /#1 \[pending\] Ready/);
+  assert.doesNotMatch(readyResult.content[0].text, /Blocked/);
+  assert.doesNotMatch(readyResult.content[0].text, /Done/);
+  assert.deepEqual(readyResult.details.tasks.map((task: { id: string }) => task.id), [ready.id]);
+
+  const completedResult = await tools.get("TaskList").execute("call-2", { status: "completed" }, undefined, undefined, createCtx());
+  assert.match(completedResult.content[0].text, /#3 \[completed\] Done/);
+  assert.doesNotMatch(completedResult.content[0].text, /Ready/);
+  assert.deepEqual(completedResult.details.tasks.map((task: { id: string }) => task.id), [done.id]);
+
+  assert.equal(blocked.blockedBy[0], ready.id);
+});
+
+test("TaskGet returns details including dependency, evidence, and metadata", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const parent = taskStore.createTask("session-1", { title: "Parent", prompt: "First", cwd: "/repo" });
+  const child = taskStore.createTask("session-1", { title: "Child", prompt: "Second", blockedBy: [parent.id], metadata: { packetId: "packet-1" }, cwd: "/repo" });
+  taskStore.recordEvidence("session-1", child.id, { id: "ev-1", kind: "note", text: "checked", ts: "2026-01-01T00:00:00.000Z" });
+  const { tools } = createHarness();
+
+  const result = await tools.get("TaskGet").execute("call-1", { taskId: child.id }, undefined, undefined, createCtx());
+
+  assert.match(result.content[0].text, /Task #2: Child/);
+  assert.match(result.content[0].text, /Blocked by: #1/);
+  assert.match(result.content[0].text, /Evidence:\n- \[note\] checked/);
+  assert.match(result.content[0].text, /Metadata: \{"packetId":"packet-1"\}/);
+  assert.equal(result.details.task.id, child.id);
+});
+
+test("TaskUpdate merges metadata, edits dependency edges, records notes, and deletes", async () => {
+  const events: TaskEvent[] = [];
+  taskStore.reset();
+  taskStore.setEventAppender((event) => events.push(event));
+  const blocker = taskStore.createTask("session-1", { title: "Blocker", prompt: "First", cwd: "/repo" });
+  const target = taskStore.createTask("session-1", { title: "Target", prompt: "Second", metadata: { keep: "yes", remove: "old" }, cwd: "/repo" });
+  const { tools } = createHarness();
+
+  const updated = await tools.get("TaskUpdate").execute("call-1", {
+    taskId: target.id,
+    subject: "Updated target",
+    metadata: { remove: null, added: "new" },
+    addBlockedBy: [blocker.id],
+    note: "linked dependency",
+  }, undefined, undefined, createCtx());
+
+  assert.match(updated.content[0].text, /Updated task #2: pending — Updated target/);
+  assert.deepEqual(taskStore.readTask("session-1", target.id)?.metadata, { keep: "yes", added: "new" });
+  assert.deepEqual(taskStore.readTask("session-1", target.id)?.blockedBy, [blocker.id]);
+  assert.deepEqual(taskStore.readTask("session-1", blocker.id)?.blocks, [target.id]);
+  assert.ok(taskStore.readTask("session-1", target.id)?.evidence.some((e) => e.text === "linked dependency"));
+
+  await tools.get("TaskUpdate").execute("call-2", { taskId: target.id, removeBlockedBy: [blocker.id] }, undefined, undefined, createCtx());
+  assert.deepEqual(taskStore.readTask("session-1", target.id)?.blockedBy, []);
+  assert.deepEqual(taskStore.readTask("session-1", blocker.id)?.blocks, []);
+
+  const deleted = await tools.get("TaskUpdate").execute("call-3", { taskId: target.id, status: "deleted" }, undefined, undefined, createCtx());
+  assert.match(deleted.content[0].text, /Task #2 deleted/);
+  assert.equal(taskStore.readTask("session-1", target.id), null);
+});
+
 test("TaskStop does not cancel a completed task when interrupt fails", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
