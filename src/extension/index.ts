@@ -2,6 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { taskStore } from "./src/task-store.ts";
 import { getBranchTaskEvents } from "./src/task-projection.ts";
 import { taskStoreKey } from "./src/session-key.ts";
+import { safeClearWidget, safeSetStatus } from "./src/safe-ui.ts";
+import { asyncCompletionStatus, asyncCompletionSummary, asyncSubagentRef, stringField, taskMatchesAsyncCompletion } from "./src/async-completion.ts";
 import { type TaskActivity, type TaskItem, type TaskRunStatus, type TaskSubagentRef } from "./src/task-state.ts";
 import { registerTaskTools } from "./src/task-tools.ts";
 import { registerTaskCommands } from "./src/task-commands.ts";
@@ -125,10 +127,8 @@ function cleanupRuntime(ctx: ExtensionContext, rt: TaskRuntime): void {
     clearInterval(rt.widgetTimer);
     rt.widgetTimer = null;
   }
-  if (ctx.hasUI) {
-    try { ctx.ui.setWidget("pi-tasks", undefined); } catch { /* stale UI */ }
-    try { ctx.ui.setStatus("pi-tasks", undefined); } catch { /* stale UI */ }
-  }
+  safeClearWidget(ctx);
+  safeSetStatus(ctx, undefined);
 }
 
 function reconstruct(ctx: ExtensionContext): void {
@@ -161,54 +161,6 @@ function recordActivity(state: TaskExtensionState, scope: string, taskId: string
 
 function clearActivity(state: TaskExtensionState, scope: string, taskId: string): void {
   state.activity.delete(activityKey(scope, taskId));
-}
-
-function stringField(obj: Record<string, unknown>, key: string): string | undefined {
-  const value = obj[key];
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function asyncCompletionStatus(data: Record<string, unknown>): TaskRunStatus {
-  if (data.success === false) return "failed";
-  const raw = stringField(data, "status") ?? stringField(data, "state");
-  if (raw && /fail|error/i.test(raw)) return "failed";
-  if (raw && /cancel|kill|interrupt/i.test(raw)) return "cancelled";
-  const results = Array.isArray(data.results) ? data.results as Array<Record<string, unknown>> : [];
-  if (results.some((result) => /fail|error/i.test(stringField(result, "status") ?? ""))) return "failed";
-  if (results.some((result) => /cancel|kill|interrupt/i.test(stringField(result, "status") ?? ""))) return "cancelled";
-  return "completed";
-}
-
-function asyncCompletionSummary(data: Record<string, unknown>): string {
-  const direct = stringField(data, "summary") ?? stringField(data, "result") ?? stringField(data, "message") ?? stringField(data, "error");
-  if (direct) return direct;
-  const results = Array.isArray(data.results) ? data.results as Array<Record<string, unknown>> : [];
-  const summaries = results
-    .map((result) => stringField(result, "summary") ?? stringField(result, "finalOutput") ?? stringField(result, "error"))
-    .filter((value): value is string => typeof value === "string" && value.length > 0);
-  return summaries.join("\n\n") || "Async subagent run completed.";
-}
-
-function taskMatchesAsyncCompletion(task: TaskItem, ids: Set<string>): boolean {
-  const ref = task.run?.subagent;
-  if (!ref) return false;
-  return [ref.asyncId, ref.runId, ref.requestId, task.run?.id, task.owner]
-    .some((id) => typeof id === "string" && ids.has(id));
-}
-
-function asyncSubagentRef(data: Record<string, unknown>, current: TaskSubagentRef): Partial<TaskSubagentRef> {
-  const results = Array.isArray(data.results) ? data.results as Array<Record<string, unknown>> : [];
-  const values = (key: string) => Array.from(new Set(results
-    .map((result) => stringField(result, key))
-    .filter((value): value is string => typeof value === "string" && value.length > 0)));
-  return {
-    asyncId: stringField(data, "id") ?? stringField(data, "asyncId") ?? current.asyncId,
-    asyncDir: stringField(data, "asyncDir") ?? current.asyncDir,
-    runId: stringField(data, "runId") ?? current.runId,
-    sessionFiles: Array.from(new Set([...current.sessionFiles, ...values("sessionFile"), ...values("sessionPath")])),
-    artifactOutputs: Array.from(new Set([...current.artifactOutputs, ...values("artifactPath")])),
-    savedOutputs: Array.from(new Set([...current.savedOutputs, ...values("savedOutputPath"), ...values("savedOutput")])),
-  };
 }
 
 export default function piTasksExtension(pi: ExtensionAPI): void {

@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatDuration, primarySavedOutput, runOutputPaths, statusIcon, taskStats } from "./format.ts";
+import { safeClearWidget } from "./safe-ui.ts";
 import type { taskStore } from "./task-store.ts";
 import { filterVisible, indexById, isTaskBlocked, readyTasksWithIndex, unresolvedBlockersById, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
 
@@ -268,9 +269,7 @@ export function createTaskWidget(
       clearInterval(rt.widgetTimer);
       rt.widgetTimer = null;
     }
-    if (ctx.hasUI) {
-      try { ctx.ui.setWidget("pi-tasks", undefined); } catch { /* stale UI */ }
-    }
+    safeClearWidget(ctx);
   }
 
   function repaint(ctx: ExtensionContext, rt: TaskWidgetRuntime): void {

@@ -20,6 +20,8 @@ import { formatOutputFilesSection, formatTaskLine, outputReadHint, runOutputPath
 import {
   buildTaskPrompt,
   requestSubagentRun,
+  responseIsError,
+  resultIsFailed,
   subagentRefFromResponse,
   subagentRefFromResult,
   subagentRefFromRun,
@@ -59,13 +61,7 @@ import {
   textResult,
   sortedTasks,
 } from "./task-schemas.ts";
-
-/** Update the pi-tasks status line, swallowing errors when the UI is stale
- *  during session replacement (hot reload, /fork, /tree). Centralizes the
- *  repeated `try { ctx.ui.setStatus(...) } catch {}` noise. */
-function safeSetStatus(ctx: ExtensionContext, text: string | undefined): void {
-  try { ctx.ui.setStatus("pi-tasks", text); } catch { /* UI may be stale during session replacement */ }
-}
+import { safeSetStatus } from "./safe-ui.ts";
 
 function taskIdsToRun(args: TaskRunArgs, ctx: ExtensionContext): string[] {
   const ids = args.task_ids ?? (taskId(args) ? [taskId(args)!] : undefined);
@@ -148,11 +144,7 @@ function childParamsForTask(task: TaskItem, all: TaskItem[], args: TaskRunArgs |
 }
 
 function resultStatus(response: { isError?: boolean; result?: { isError?: boolean } }, result: SubagentSingleResultLike | undefined): TaskRunStatus {
-  if (response.isError || response.result?.isError) return "failed";
-  if (!result) return "failed";
-  if (typeof result.exitCode === "number" && result.exitCode !== 0) return "failed";
-  if (typeof result.error === "string" && result.error.length > 0) return "failed";
-  return "completed";
+  return responseIsError(response) || resultIsFailed(result) ? "failed" : "completed";
 }
 
 function resultSummary(result: SubagentSingleResultLike | undefined, fallback: string): string {
@@ -480,6 +472,33 @@ async function refreshAsyncStatus(pi: ExtensionAPI, ctx: ExtensionContext, task:
 
 export type TaskChangeHandler = (ctx: ExtensionContext, eventType: string, data?: Record<string, unknown>) => void;
 
+/**
+ * Shared "read before → optionally refresh async status → read latest" prologue
+ * used by both getTaskStatus and getTaskOutput. Centralizes the async-refresh
+ * try/catch and the status-delta onTaskChanged firing so the two tools can't
+ * drift on the close-out contract. Returns the pre/post snapshot plus the
+ * refreshed status text (or an error message if refresh threw).
+ */
+async function refreshAndSnapshot(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  id: string,
+  shouldRefresh: boolean,
+  signal: AbortSignal | undefined,
+  onTaskChanged: TaskChangeHandler,
+): Promise<{ latest: TaskItem | null; refreshed: string | undefined }> {
+  const scope = taskStoreKey(ctx);
+  const before = taskStore.readTask(scope, id);
+  if (!before) return { latest: null, refreshed: undefined };
+  let refreshed: string | undefined;
+  if (shouldRefresh) {
+    try { refreshed = await refreshAsyncStatus(pi, ctx, before, signal); } catch (error) { refreshed = `Status refresh failed: ${error instanceof Error ? error.message : String(error)}`; }
+  }
+  const latest = taskStore.readTask(scope, id) ?? before;
+  if (latest.status !== before.status) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
+  return { latest, refreshed };
+}
+
 export async function runTasks(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -540,14 +559,9 @@ export async function getTaskStatus(
     return textResult(lines.join("\n"), { tasks, ready, active, failed });
   }
 
-  const before = taskStore.readTask(scope, id);
-  if (!before) return textResult(`Task #${id} not found.`, { task: null });
-  let refreshed: string | undefined;
-  if (params.refresh !== false) {
-    try { refreshed = await refreshAsyncStatus(pi, ctx, before, signal); } catch (error) { refreshed = `Status refresh failed: ${error instanceof Error ? error.message : String(error)}`; }
-  }
-  const latest = taskStore.readTask(scope, id) ?? before;
-  if (latest.status !== before.status) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
+  const idBranch = await refreshAndSnapshot(pi, ctx, id, params.refresh !== false, signal, onTaskChanged);
+  if (!idBranch.latest) return textResult(`Task #${id} not found.`, { task: null });
+  const { latest, refreshed } = idBranch;
   const lines = [formatTaskLine(latest, taskStore.readAll(scope))];
   if (latest.run) lines.push(`run: ${latest.run.status} via ${latest.run.agent}${taskRunRefId(latest) ? ` (${taskRunRefId(latest)})` : ""}`);
   if (refreshed) lines.push(`refresh: ${firstLine(refreshed)}`);
@@ -566,14 +580,9 @@ export async function getTaskOutput(
   const id = taskId(params);
   if (!id) throw new Error("taskId is required.");
   const scope = taskStoreKey(ctx);
-  const task = taskStore.readTask(scope, id);
-  if (!task) return textResult(`Task #${id} not found.`, { task: null });
-  let refreshed: string | undefined;
-  if (params.refresh !== false) {
-    try { refreshed = await refreshAsyncStatus(pi, ctx, task, signal); } catch (error) { refreshed = `Status refresh failed: ${error instanceof Error ? error.message : String(error)}`; }
-  }
-  const latest = taskStore.readTask(scope, id) ?? task;
-  if (latest.status !== task.status) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
+  const snapshot = await refreshAndSnapshot(pi, ctx, id, params.refresh !== false, signal, onTaskChanged);
+  if (!snapshot.latest) return textResult(`Task #${id} not found.`, { task: null });
+  const { latest, refreshed } = snapshot;
   const paths = runOutputPaths(latest.run?.subagent);
   const sections = [
     `Task #${latest.id} [${latest.status}] ${latest.title}`,
@@ -606,7 +615,7 @@ export async function stopTask(
   if (runId) {
     const response = await requestSubagentRun(pi, ctx, { action: "interrupt", id: runId, cwd: ctx.cwd }, signal);
     message = textBlock(response.result.content) || response.errorText || "Interrupt requested.";
-    if (response.isError || response.result.isError) {
+    if (responseIsError(response)) {
       return textResult(`Task #${id} stop failed; task state was not changed.\n\n${message}`, { task, error: message });
     }
   } else {

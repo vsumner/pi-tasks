@@ -264,13 +264,31 @@ export function summarizeSubagentResponse(response: SlashSubagentResponseLike): 
   return response.errorText ?? "(no subagent output)";
 }
 
+/** Response-level failure: the subagent bridge itself reported an error.
+ *  Typed loosely (optional isError/result) so it accepts both the full
+ *  SlashSubagentResponseLike and the looser shape used by run-engine's
+ *  per-child resultStatus mapper. */
+export function responseIsError(response: { isError?: boolean; result?: { isError?: boolean } }): boolean {
+  return Boolean(response.isError || response.result?.isError);
+}
+
+/** A single child result is failed if it is missing, exited non-zero, or errored.
+ *  Shared by the single-run status mapper (subagentRunStatus) and the
+ *  per-child mapper (run-engine resultStatus) so the failure vocabulary can't
+ *  drift between the two paths. */
+export function resultIsFailed(result: SubagentSingleResultLike | undefined): boolean {
+  if (!result) return true;
+  if (typeof result.exitCode === "number" && result.exitCode !== 0) return true;
+  if (typeof result.error === "string" && result.error.length > 0) return true;
+  return false;
+}
+
 export function subagentRunStatus(response: SlashSubagentResponseLike, requestedAsync: boolean): TaskRunStatus {
-  if (response.isError || response.result.isError) return "failed";
+  if (responseIsError(response)) return "failed";
   const details = response.result.details;
   const results = details?.results ?? [];
   if (requestedAsync || typeof details?.asyncId === "string" || results.some((r) => r.detached)) return "detached";
-  if (results.some((r) => typeof r.exitCode === "number" && r.exitCode !== 0)) return "failed";
-  if (results.some((r) => typeof r.error === "string" && r.error.length > 0)) return "failed";
+  if (results.some((r) => resultIsFailed(r))) return "failed";
   return "completed";
 }
 
