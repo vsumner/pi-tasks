@@ -69,7 +69,7 @@ function createHarness(options: { parallelResultCount?: number; statusText?: str
     events,
   };
   const activityCalls: Array<{ taskId: string; tool?: string; count: number }> = [];
-  registerTaskTools(pi as any, () => {}, (_scope, taskId, activity) => {
+  registerTaskTools(pi as any, taskStore, () => {}, (_scope, taskId, activity) => {
     activityCalls.push({ taskId, tool: activity.tool, count: activity.count });
   });
   return { tools, events, activityCalls };

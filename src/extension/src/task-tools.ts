@@ -7,7 +7,7 @@ import {
   TASK_UPDATED_EVENT,
 } from "./events.ts";
 import { formatTaskLine } from "./format.ts";
-import { taskStore, type TaskUpdateInput } from "./task-store.ts";
+import { type TaskStore, type TaskUpdateInput } from "./task-store.ts";
 import { taskStoreKey } from "./session-key.ts";
 import { acceptanceValidationError, validateAcceptance, makeEvidence, filterVisible, type TaskAcceptance, type TaskActivityHandler, type TaskStatus } from "./task-state.ts";
 import {
@@ -52,6 +52,7 @@ import {
 
 export function registerTaskTools(
   pi: ExtensionAPI,
+  store: TaskStore,
   onTaskChanged: (ctx: ExtensionContext, eventType: string, data?: Record<string, unknown>) => void,
   onActivity?: TaskActivityHandler,
 ): void {
@@ -73,7 +74,7 @@ export function registerTaskTools(
     async execute(_id, params: TaskCreateArgs, _signal, _onUpdate, ctx) {
       const acceptanceErrors = validateAcceptance(params.acceptance);
       if (acceptanceErrors.length > 0) throw acceptanceValidationError(acceptanceErrors);
-      const task = taskStore.createTask(taskStoreKey(ctx), {
+      const task = store.createTask(taskStoreKey(ctx), {
         title: params.subject,
         prompt: params.description,
         activeForm: params.activeForm,
@@ -116,8 +117,8 @@ export function registerTaskTools(
       // allTasks is the full set (used for accurate blocker resolution in
       // formatTaskLine); only the listed rows are filtered to visible tasks so
       // internal bookkeeping tasks never reach the model.
-      const allTasks = taskStore.readAll(scope);
-      const source = params.ready_only ? taskStore.ready(scope) : allTasks;
+      const allTasks = store.readAll(scope);
+      const source = params.ready_only ? store.ready(scope) : allTasks;
       const tasks = sortedTasks(filterVisible(source), params);
       if (tasks.length === 0) return textResult(params.ready_only ? "No ready tasks." : "No tasks found.", { tasks });
       return textResult(tasks.map((task) => formatTaskLine(task, allTasks)).join("\n"), { tasks });
@@ -134,7 +135,7 @@ export function registerTaskTools(
     async execute(_id, params: TaskIdArgs, _signal, _onUpdate, ctx) {
       const id = taskId(params);
       if (!id) throw new Error("taskId is required.");
-      const task = taskStore.readTask(taskStoreKey(ctx), id);
+      const task = store.readTask(taskStoreKey(ctx), id);
       if (!task) return textResult(`Task #${id} not found.`, { task: null });
       return textResult(taskDetails(task), { task });
     },
@@ -161,7 +162,7 @@ export function registerTaskTools(
       const acceptanceErrors = validateAcceptance(params.acceptance);
       if (acceptanceErrors.length > 0) throw acceptanceValidationError(acceptanceErrors);
       if (params.status === "deleted") {
-        taskStore.deleteTask(taskStoreKey(ctx), id);
+        store.deleteTask(taskStoreKey(ctx), id);
         onTaskChanged(ctx, TASK_DELETED_EVENT, { taskId: id });
         return textResult(`Task #${id} deleted.`, { taskId: id });
       }
@@ -185,16 +186,16 @@ export function registerTaskTools(
         metadata: params.metadata,
       };
       const scope = taskStoreKey(ctx);
-      const before = taskStore.readTask(scope, id);
-      let task = taskStore.updateTask(scope, id, update);
+      const before = store.readTask(scope, id);
+      let task = store.updateTask(scope, id, update);
       if (params.note?.trim()) {
-        task = taskStore.recordEvidence(scope, id, makeEvidence("note", params.note.trim(), { source: "TaskUpdate" }));
+        task = store.recordEvidence(scope, id, makeEvidence("note", params.note.trim(), { source: "TaskUpdate" }));
         onTaskChanged(ctx, TASK_EVIDENCE_RECORDED_EVENT, { taskId: id });
       } else {
         onTaskChanged(ctx, TASK_UPDATED_EVENT, { taskId: id });
       }
       const completionHint = params.status === "completed" && before?.status !== "completed"
-        ? completionFollowupHint(scope)
+        ? completionFollowupHint(store, scope)
         : "";
       return textResult(`Updated task #${id}: ${task.status} — ${task.title}${completionHint}`, { task });
     },
@@ -215,7 +216,7 @@ export function registerTaskTools(
       const id = taskId(params);
       if (!id) throw new Error("taskId is required.");
       const scope = taskStoreKey(ctx);
-      const result = taskStore.claimTask(scope, id, {
+      const result = store.claimTask(scope, id, {
         owner: params.owner,
         start: params.start,
         force: params.force,
@@ -250,7 +251,7 @@ export function registerTaskTools(
     parameters: TaskRunParams,
     executionMode: "sequential",
     async execute(_id, params: TaskRunArgs, signal, _onUpdate, ctx) {
-      return runTasks(pi, ctx, params, signal ?? undefined, onTaskChanged, onActivity);
+      return runTasks(pi, ctx, params, signal ?? undefined, onTaskChanged, onActivity, store);
     },
   });
 
@@ -261,7 +262,7 @@ export function registerTaskTools(
     parameters: TaskStatusParams,
     executionMode: "sequential",
     async execute(_id, params: TaskStatusArgs, signal, _onUpdate, ctx) {
-      return getTaskStatus(pi, ctx, params, signal ?? undefined, onTaskChanged);
+      return getTaskStatus(pi, ctx, params, signal ?? undefined, onTaskChanged, store);
     },
   });
 
@@ -272,7 +273,7 @@ export function registerTaskTools(
     parameters: TaskOutputParams,
     executionMode: "sequential",
     async execute(_id, params: TaskOutputArgs, signal, _onUpdate, ctx) {
-      return getTaskOutput(pi, ctx, params, signal ?? undefined, onTaskChanged);
+      return getTaskOutput(pi, ctx, params, signal ?? undefined, onTaskChanged, store);
     },
   });
 
@@ -283,7 +284,7 @@ export function registerTaskTools(
     parameters: TaskResumeParams,
     executionMode: "sequential",
     async execute(_id, params: TaskResumeArgs, signal, _onUpdate, ctx) {
-      return resumeTask(pi, ctx, params, signal ?? undefined, onTaskChanged);
+      return resumeTask(pi, ctx, params, signal ?? undefined, onTaskChanged, store);
     },
   });
 
@@ -294,7 +295,7 @@ export function registerTaskTools(
     parameters: TaskRetryParams,
     executionMode: "sequential",
     async execute(_id, params: TaskRetryArgs, signal, _onUpdate, ctx) {
-      return retryTask(pi, ctx, params, signal ?? undefined, onTaskChanged, onActivity);
+      return retryTask(pi, ctx, params, signal ?? undefined, onTaskChanged, onActivity, store);
     },
   });
 
@@ -305,7 +306,7 @@ export function registerTaskTools(
     parameters: TaskWaitParams,
     executionMode: "sequential",
     async execute(_id, params: TaskWaitArgs, signal, _onUpdate, ctx) {
-      return waitForTask(pi, ctx, params, signal ?? undefined, onTaskChanged);
+      return waitForTask(pi, ctx, params, signal ?? undefined, onTaskChanged, store);
     },
   });
 
@@ -316,7 +317,7 @@ export function registerTaskTools(
     parameters: TaskIdParams,
     executionMode: "sequential",
     async execute(_id, params: TaskIdArgs, signal, _onUpdate, ctx) {
-      return stopTask(pi, ctx, params, signal ?? undefined, onTaskChanged);
+      return stopTask(pi, ctx, params, signal ?? undefined, onTaskChanged, store);
     },
   });
 }

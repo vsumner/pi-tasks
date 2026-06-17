@@ -174,7 +174,7 @@ export function registerTaskCommands(
           parallel: flag(tokens, "--parallel"),
           concurrency: concurrencyRaw ? Number(concurrencyRaw) : undefined,
           force: flag(tokens, "--force"),
-        }, undefined, onTaskChanged);
+        }, undefined, onTaskChanged, undefined, store);
         refreshWidget(ctx);
         notify(ctx, commandText(result));
         return;
@@ -182,7 +182,7 @@ export function registerTaskCommands(
 
       if (action === "status") {
         const id = tokens.find((token) => /^\d+$/.test(token));
-        const result = await getTaskStatus(pi, ctx, { taskId: id, refresh: !flag(tokens, "--no-refresh") }, undefined, onTaskChanged);
+        const result = await getTaskStatus(pi, ctx, { taskId: id, refresh: !flag(tokens, "--no-refresh") }, undefined, onTaskChanged, store);
         refreshWidget(ctx);
         notify(ctx, commandText(result));
         return;
@@ -191,7 +191,7 @@ export function registerTaskCommands(
       if (action === "output") {
         const id = tokens.find((token) => /^\d+$/.test(token));
         if (!requireId(ctx, action, id)) return;
-        const result = await getTaskOutput(pi, ctx, { taskId: id, refresh: !flag(tokens, "--no-refresh") }, undefined, onTaskChanged);
+        const result = await getTaskOutput(pi, ctx, { taskId: id, refresh: !flag(tokens, "--no-refresh") }, undefined, onTaskChanged, store);
         refreshWidget(ctx);
         notify(ctx, commandText(result));
         return;
@@ -200,7 +200,7 @@ export function registerTaskCommands(
       if (action === "stop") {
         const id = tokens.find((token) => /^\d+$/.test(token));
         if (!requireId(ctx, action, id)) return;
-        const result = await stopTask(pi, ctx, { taskId: id }, undefined, onTaskChanged);
+        const result = await stopTask(pi, ctx, { taskId: id }, undefined, onTaskChanged, store);
         refreshWidget(ctx);
         notify(ctx, commandText(result));
         return;
@@ -211,7 +211,7 @@ export function registerTaskCommands(
         if (!requireId(ctx, action, id)) return;
         const idIndex = tokens.indexOf(id);
         const message = idIndex >= 0 ? tokens.slice(idIndex + 1).join(" ") : undefined;
-        const result = await resumeTask(pi, ctx, { taskId: id, message }, undefined, onTaskChanged);
+        const result = await resumeTask(pi, ctx, { taskId: id, message }, undefined, onTaskChanged, store);
         refreshWidget(ctx);
         notify(ctx, commandText(result));
         return;
@@ -220,7 +220,7 @@ export function registerTaskCommands(
       if (action === "retry") {
         const id = tokens.find((token) => /^\d+$/.test(token));
         if (!requireId(ctx, action, id)) return;
-        const result = await retryTask(pi, ctx, { taskId: id, async: flag(tokens, "--async"), force: flag(tokens, "--force") }, undefined, onTaskChanged);
+        const result = await retryTask(pi, ctx, { taskId: id, async: flag(tokens, "--async"), force: flag(tokens, "--force") }, undefined, onTaskChanged, undefined, store);
         refreshWidget(ctx);
         notify(ctx, commandText(result));
         return;
@@ -231,7 +231,7 @@ export function registerTaskCommands(
         if (!requireId(ctx, action, id)) return;
         const timeout = flagValue(tokens, "--timeout-ms");
         const poll = flagValue(tokens, "--poll-ms");
-        const result = await waitForTask(pi, ctx, { taskId: id, timeout_ms: timeout ? Number(timeout) : undefined, poll_ms: poll ? Number(poll) : undefined }, undefined, onTaskChanged);
+        const result = await waitForTask(pi, ctx, { taskId: id, timeout_ms: timeout ? Number(timeout) : undefined, poll_ms: poll ? Number(poll) : undefined }, undefined, onTaskChanged, store);
         refreshWidget(ctx);
         notify(ctx, commandText(result));
         return;

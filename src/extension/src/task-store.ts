@@ -286,11 +286,42 @@ export class TaskStore {
   }
 
   applyEvents(cwd: string, events: TaskEvent[]): void {
-    let projected = new Map<string, TaskItem>();
-    let highWater = 0;
-    for (const event of events) {
-      projected = applyTaskEventToMap(projected, event);
-      highWater = Math.max(highWater, highWaterFromEvent(event) ?? 0);
+    // Snapshot-seeded replay: a TASK_SNAPSHOT event resets the projection to its
+    // task list, so events before the last snapshot are dead weight. Seed the
+    // map directly from that snapshot and replay only the post-snapshot tail.
+    // On a long session this turns a full reconstruct from O(all events) into
+    // O(snapshot size + post-snapshot events). When there is no snapshot, fall
+    // back to replaying from an empty map (unchanged behavior).
+    let snapshotIndex = -1;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const candidate = events[i];
+      const version = candidate.data?.version;
+      const versionOk = typeof version !== "number" || version <= TASK_EVENT_VERSION;
+      if ((candidate.customType ?? candidate.type) === TASK_SNAPSHOT_EVENT && versionOk) {
+        snapshotIndex = i;
+        break;
+      }
+    }
+    let projected: Map<string, TaskItem>;
+    let highWater: number;
+    let start: number;
+    if (snapshotIndex >= 0) {
+      const snapshot = events[snapshotIndex];
+      const snapshotTasks = Array.isArray(snapshot.data?.tasks) ? (snapshot.data!.tasks as TaskItem[]) : [];
+      projected = new Map<string, TaskItem>();
+      for (const task of snapshotTasks) {
+        if (task && typeof task.id === "string") projected.set(task.id, clone(task));
+      }
+      highWater = highWaterFromEvent(snapshot) ?? 0;
+      start = snapshotIndex + 1;
+    } else {
+      projected = new Map<string, TaskItem>();
+      highWater = 0;
+      start = 0;
+    }
+    for (let i = start; i < events.length; i++) {
+      projected = applyTaskEventToMap(projected, events[i]);
+      highWater = Math.max(highWater, highWaterFromEvent(events[i]) ?? 0);
     }
     this.tasksByCwd.set(cwd, projected);
     this.highWaterIdsByCwd.set(cwd, Math.max(highWater, ...Array.from(projected.keys(), (id) => numericTaskId(id) ?? 0)));

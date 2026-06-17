@@ -453,7 +453,16 @@ function supportedEventVersion(data: Record<string, unknown>): boolean {
 }
 
 export function applyTaskEventToMap(current: Map<string, TaskItem>, event: TaskEvent): Map<string, TaskItem> {
-  const tasks = new Map(Array.from(current.entries(), ([id, task]) => [id, clone(task)] as const));
+  // Structural sharing: copy the map shallowly (reference entries only) and
+  // clone just the task(s) an event touches. The upsert branches below all go
+  // through upsertTask()/applyPatch(), which return fresh clones, so they
+  // never mutate an entry shared with the prior map in place. DELETED and
+  // CLEARED are the only branches that rewrite dependency arrays, so they
+  // clone only the affected tasks rather than the whole map. This keeps a
+  // single event O(affected) instead of O(n) deep-clones, and is safe because
+  // every read path (readAll/readTask) already returns defensive clones — no
+  // caller holds a live reference into this projection map.
+  const tasks = new Map(current);
   const customType = event.customType ?? event.type;
   const data = event.data ?? {};
   const ts = event.ts ?? now();
@@ -569,10 +578,15 @@ export function applyTaskEventToMap(current: Map<string, TaskItem>, event: TaskE
     case TASK_DELETED_EVENT: {
       const taskId = String(data.taskId ?? "");
       tasks.delete(taskId);
-      for (const task of tasks.values()) {
-        task.blocks = task.blocks.filter((id) => id !== taskId);
-        task.blockedBy = task.blockedBy.filter((id) => id !== taskId);
-        task.updatedAt = ts;
+      // Only tasks that referenced the deleted id need a fresh copy; untouched
+      // entries stay shared with the prior map.
+      for (const [otherId, task] of tasks) {
+        if (!task.blocks.includes(taskId) && !task.blockedBy.includes(taskId)) continue;
+        const next = clone(task);
+        next.blocks = next.blocks.filter((id) => id !== taskId);
+        next.blockedBy = next.blockedBy.filter((id) => id !== taskId);
+        next.updatedAt = ts;
+        tasks.set(otherId, next);
       }
       return tasks;
     }
@@ -591,10 +605,13 @@ export function applyTaskEventToMap(current: Map<string, TaskItem>, event: TaskE
         }
       }
       if (deleted.size > 0) {
-        for (const task of tasks.values()) {
-          task.blocks = task.blocks.filter((id) => !deleted.has(id));
-          task.blockedBy = task.blockedBy.filter((id) => !deleted.has(id));
-          task.updatedAt = ts;
+        for (const [otherId, task] of tasks) {
+          if (!task.blocks.some((b) => deleted.has(b)) && !task.blockedBy.some((b) => deleted.has(b))) continue;
+          const next = clone(task);
+          next.blocks = next.blocks.filter((id) => !deleted.has(id));
+          next.blockedBy = next.blockedBy.filter((id) => !deleted.has(id));
+          next.updatedAt = ts;
+          tasks.set(otherId, next);
         }
       }
       return tasks;

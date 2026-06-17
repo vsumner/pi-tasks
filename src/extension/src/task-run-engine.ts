@@ -33,8 +33,8 @@ import {
   type SubagentSingleResultLike,
   type AgentProgressLike,
 } from "./subagents.ts";
-import { taskStore } from "./task-store.ts";
 import { taskStoreKey } from "./session-key.ts";
+import type { TaskStore } from "./task-store.ts";
 import {
   indexById,
   isTerminalStatus,
@@ -63,10 +63,10 @@ import {
 } from "./task-schemas.ts";
 import { safeSetStatus } from "./safe-ui.ts";
 
-function taskIdsToRun(args: TaskRunArgs, ctx: ExtensionContext): string[] {
+function taskIdsToRun(args: TaskRunArgs, ctx: ExtensionContext, store: TaskStore): string[] {
   const ids = args.task_ids ?? (taskId(args) ? [taskId(args)!] : undefined);
   if (ids && ids.length > 0) return ids;
-  if (args.ready) return taskStore.ready(taskStoreKey(ctx)).map((task) => task.id);
+  if (args.ready) return store.ready(taskStoreKey(ctx)).map((task) => task.id);
   throw new Error("TaskRun requires taskId/task_id/task_ids, or ready=true.");
 }
 
@@ -114,7 +114,7 @@ function makeResumeRun(task: TaskItem, agent: string): TaskRunRecord {
   };
 }
 
-function canRun(task: TaskItem, all: TaskItem[], force: boolean | undefined): string | undefined {
+export function canRun(task: TaskItem, all: TaskItem[], force: boolean | undefined): string | undefined {
   if (force) return undefined;
   if (task.status !== "pending") return `not pending (status: ${task.status})`;
   // task is already confirmed pending, so it is ready iff it is not blocked.
@@ -143,8 +143,35 @@ function childParamsForTask(task: TaskItem, all: TaskItem[], args: TaskRunArgs |
   };
 }
 
-function resultStatus(response: { isError?: boolean; result?: { isError?: boolean } }, result: SubagentSingleResultLike | undefined): TaskRunStatus {
+export function resultStatus(response: { isError?: boolean; result?: { isError?: boolean } }, result: SubagentSingleResultLike | undefined): TaskRunStatus {
   return responseIsError(response) || resultIsFailed(result) ? "failed" : "completed";
+}
+
+/**
+ * Close out a failed/cancelled run for a single task: completeRun with the
+ * error as summary + structured evidence metadata, then fire the finished
+ * change event. Centralizes the catch-block close-out shared by runOneTask /
+ * resumeTask and used per-task by the parallel failure path, so the run-status
+ * derivation, evidence metadata shape, and event payload can't drift between
+ * the three sites.
+ */
+function recordFailedRun(
+  store: TaskStore,
+  scope: string,
+  taskId: string,
+  status: TaskRunStatus,
+  runId: string,
+  message: string,
+  evidenceMetadata: Record<string, unknown>,
+  onChange: (eventType: string, data?: Record<string, unknown>) => void,
+  extraChangeData: Record<string, unknown> = {},
+): void {
+  store.completeRun(scope, taskId, status, {
+    summary: message,
+    error: message,
+    evidenceMetadata,
+  });
+  onChange(TASK_RUN_FINISHED_EVENT, { taskId, runId, status, ...extraChangeData });
 }
 
 function resultSummary(result: SubagentSingleResultLike | undefined, fallback: string): string {
@@ -171,7 +198,7 @@ export function activeFormHint(activeForm: string | undefined): string {
     : "\nTip: set activeForm to a present-continuous label (e.g. 'Running tests') so the task shows useful progress while in_progress.";
 }
 
-function hasVerificationEvidence(task: TaskItem): boolean {
+export function hasVerificationEvidence(task: TaskItem): boolean {
   if (task.evidence.some((e) => e.kind === "proof" || e.kind === "review" || e.passed === true)) {
     return true;
   }
@@ -186,8 +213,12 @@ function hasVerificationEvidence(task: TaskItem): boolean {
   );
 }
 
-export function completionFollowupHint(scope: string): string {
-  const all = taskStore.readAll(scope);
+export function classifyRunError(message: string): TaskRunStatus {
+  return /cancelled|canceled|aborted/i.test(message) ? "cancelled" : "failed";
+}
+
+export function completionFollowupHint(store: TaskStore, scope: string): string {
+  const all = store.readAll(scope);
   const ready = readyTasks(all);
   const openWork = all.some((task) => !isTerminalStatus(task.status));
   // Structural verification nudge (mirrors claude-src TodoWriteTool's close-out
@@ -229,24 +260,24 @@ async function runOneTask(
   args: TaskRunArgs,
   signal: AbortSignal | undefined,
   onChange: (eventType: string, data?: Record<string, unknown>) => void,
-  onActivity?: TaskActivityHandler,
+  onActivity: TaskActivityHandler | undefined,
+  store: TaskStore,
 ): Promise<string> {
   const scope = taskStoreKey(ctx);
-  const all = taskStore.readAll(scope);
+  const all = store.readAll(scope);
   const blocker = canRun(task, all, args.force);
   if (blocker) return `#${task.id}: skipped — ${blocker}`;
 
   const agent = args.agent ?? task.agent ?? "worker";
   const run = makeRun(task, agent);
-  taskStore.startRun(scope, task.id, run);
+  store.startRun(scope, task.id, run);
   onChange(TASK_RUN_STARTED_EVENT, { taskId: task.id, runId: run.id });
 
+  // Shared passthrough fields (agent/task/cwd/model/output/outputMode/skill/
+  // acceptance) come from childParamsForTask — the single source of truth also
+  // used by the parallel path. Single-run-only keys are merged on top.
   const params: SubagentParamsLike = {
-    agent,
-    task: buildTaskPrompt(task, {
-      dependencyOutputs: dependencyOutputs(task, all),
-      additionalContext: args.additional_context,
-    }),
+    ...childParamsForTask(task, all, args),
     cwd: task.cwd ?? ctx.cwd,
     context: args.context ?? "fresh",
     async: args.async ?? false,
@@ -254,13 +285,6 @@ async function runOneTask(
     // Stream per-tool progress so the widget's live activity line updates.
     includeProgress: true,
     artifacts: true,
-    ...(args.model ? { model: args.model } : {}),
-    ...(args.output !== undefined ? { output: args.output } : {}),
-    ...(args.outputMode ? { outputMode: args.outputMode } : {}),
-    ...(args.skill !== undefined ? { skill: args.skill as string | string[] | boolean } : {}),
-    ...(args.acceptance !== undefined || task.acceptance !== undefined
-      ? { acceptance: (args.acceptance ?? task.acceptance) as TaskAcceptance }
-      : {}),
   };
 
   try {
@@ -286,7 +310,7 @@ async function runOneTask(
     const summary = summarizeSubagentResponse(response);
     const subagent = subagentRefFromResponse(response.requestId, response, agent);
     const usage = usageFromResponse(response);
-    taskStore.completeRun(scope, task.id, status, {
+    store.completeRun(scope, task.id, status, {
       summary,
       error: status === "failed" ? response.errorText ?? summary : undefined,
       usage,
@@ -303,14 +327,8 @@ async function runOneTask(
     return `#${task.id}: ${status}${subagent.asyncId ? ` (async ${subagent.asyncId})` : ""}${hint ? ` — ${hint}` : ""}`;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const cancelled = /cancelled|canceled|aborted/i.test(message);
-    const status: TaskRunStatus = cancelled ? "cancelled" : "failed";
-    taskStore.completeRun(scope, task.id, status, {
-      summary: message,
-      error: message,
-      evidenceMetadata: { runId: run.id },
-    });
-    onChange(TASK_RUN_FINISHED_EVENT, { taskId: task.id, runId: run.id, status });
+    const status = classifyRunError(message);
+    recordFailedRun(store, scope, task.id, status, run.id, message, { runId: run.id }, onChange);
     return `#${task.id}: ${status} — ${message}`;
   } finally {
     safeSetStatus(ctx, undefined);
@@ -324,14 +342,15 @@ async function runTasksInParallel(
   args: TaskRunArgs,
   signal: AbortSignal | undefined,
   onChange: (eventType: string, data?: Record<string, unknown>) => void,
-  onActivity?: TaskActivityHandler,
+  onActivity: TaskActivityHandler | undefined,
+  store: TaskStore,
 ) {
   const scope = taskStoreKey(ctx);
-  const all = taskStore.readAll(scope);
+  const all = store.readAll(scope);
   const skipped: string[] = [];
   const runnable: Array<{ task: TaskItem; run: TaskRunRecord; agent: string }> = [];
   for (const id of ids) {
-    const task = taskStore.readTask(scope, id);
+    const task = store.readTask(scope, id);
     if (!task) {
       skipped.push(`#${id}: not found`);
       continue;
@@ -343,12 +362,12 @@ async function runTasksInParallel(
     }
     const agent = args.agent ?? task.agent ?? "worker";
     const run = makeRun(task, agent, `parallel-${Date.now()}-${id}`);
-    taskStore.startRun(scope, task.id, run);
+    store.startRun(scope, task.id, run);
     onChange(TASK_RUN_STARTED_EVENT, { taskId: task.id, runId: run.id, parallel: true });
     runnable.push({ task, run, agent });
   }
 
-  if (runnable.length === 0) return textResult(skipped.join("\n") || "No runnable tasks.", { results: skipped, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
+  if (runnable.length === 0) return textResult(skipped.join("\n") || "No runnable tasks.", { results: skipped, tasks: ids.map((id) => store.readTask(scope, id)) });
 
   const params: SubagentParamsLike = {
     tasks: runnable.map(({ task }) => childParamsForTask(task, all, args)),
@@ -396,7 +415,7 @@ async function runTasksInParallel(
       const summary = resultSummary(result, overall);
       const subagent = subagentRefFromResult(response.requestId, response, result, item.agent);
       const usage = usageFromResult(result);
-      taskStore.completeRun(scope, item.task.id, status, {
+      store.completeRun(scope, item.task.id, status, {
         summary,
         error: status === "failed" ? summary : undefined,
         usage,
@@ -411,22 +430,16 @@ async function runTasksInParallel(
       if (status === "completed" && item.task.status !== "completed") completedCount += 1;
       lines.push(`#${item.task.id}: ${status}`);
     }
-    return textResult(`${lines.join("\n")}${completedCount > 0 ? completionFollowupHint(scope) : ""}`, { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
+    return textResult(`${lines.join("\n")}${completedCount > 0 ? completionFollowupHint(store, scope) : ""}`, { results: lines, tasks: ids.map((id) => store.readTask(scope, id)) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const cancelled = /cancelled|canceled|aborted/i.test(message);
-    const status: TaskRunStatus = cancelled ? "cancelled" : "failed";
+    const status = classifyRunError(message);
     const lines = [...skipped];
     for (const item of runnable) {
-      taskStore.completeRun(scope, item.task.id, status, {
-        summary: message,
-        error: message,
-        evidenceMetadata: { runId: item.run.id, parallel: true },
-      });
-      onChange(TASK_RUN_FINISHED_EVENT, { taskId: item.task.id, runId: item.run.id, status, parallel: true });
+      recordFailedRun(store, scope, item.task.id, status, item.run.id, message, { runId: item.run.id, parallel: true }, onChange, { parallel: true });
       lines.push(`#${item.task.id}: ${status} — ${message}`);
     }
-    return textResult(lines.join("\n"), { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
+    return textResult(lines.join("\n"), { results: lines, tasks: ids.map((id) => store.readTask(scope, id)) });
   } finally {
     safeSetStatus(ctx, undefined);
   }
@@ -434,7 +447,7 @@ async function runTasksInParallel(
 
 const NON_TERMINAL_ASYNC_STATES = new Set(["queued", "running", "detached", "pending", "active", "in_progress"]);
 
-function parseAsyncSummaryStatus(summary: string): { status?: TaskRunStatus; warning?: string } {
+export function parseAsyncSummaryStatus(summary: string): { status?: TaskRunStatus; warning?: string } {
   const match = summary.match(/State:\s*([^\s]+)/i);
   const state = match?.[1]?.toLowerCase();
   if (!state) return { warning: "Unrecognized pi-subagents status format; task remains in_progress." };
@@ -445,7 +458,7 @@ function parseAsyncSummaryStatus(summary: string): { status?: TaskRunStatus; war
   return { warning: `Unrecognized pi-subagents status state "${state}"; task remains in_progress.` };
 }
 
-async function refreshAsyncStatus(pi: ExtensionAPI, ctx: ExtensionContext, task: TaskItem, signal?: AbortSignal): Promise<string | undefined> {
+async function refreshAsyncStatus(pi: ExtensionAPI, ctx: ExtensionContext, task: TaskItem, signal: AbortSignal | undefined, store: TaskStore): Promise<string | undefined> {
   if (task.status !== "in_progress") return undefined;
   if (!task.run) return undefined;
   if (!task.run.subagent.asyncId && task.run.status !== "detached") return undefined;
@@ -455,9 +468,9 @@ async function refreshAsyncStatus(pi: ExtensionAPI, ctx: ExtensionContext, task:
   const summary = summarizeSubagentResponse(response);
   const parsed = parseAsyncSummaryStatus(summary);
   const scope = taskStoreKey(ctx);
-  const current = taskStore.readTask(scope, task.id);
+  const current = store.readTask(scope, task.id);
   if (current?.status === "in_progress" && parsed.status) {
-    taskStore.completeRun(scope, task.id, parsed.status, {
+    store.completeRun(scope, task.id, parsed.status, {
       summary,
       error: parsed.status === "failed" || parsed.status === "cancelled" ? summary : undefined,
       evidenceMetadata: {
@@ -486,15 +499,16 @@ async function refreshAndSnapshot(
   shouldRefresh: boolean,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  store: TaskStore,
 ): Promise<{ latest: TaskItem | null; refreshed: string | undefined }> {
   const scope = taskStoreKey(ctx);
-  const before = taskStore.readTask(scope, id);
+  const before = store.readTask(scope, id);
   if (!before) return { latest: null, refreshed: undefined };
   let refreshed: string | undefined;
   if (shouldRefresh) {
-    try { refreshed = await refreshAsyncStatus(pi, ctx, before, signal); } catch (error) { refreshed = `Status refresh failed: ${error instanceof Error ? error.message : String(error)}`; }
+    try { refreshed = await refreshAsyncStatus(pi, ctx, before, signal, store); } catch (error) { refreshed = `Status refresh failed: ${error instanceof Error ? error.message : String(error)}`; }
   }
-  const latest = taskStore.readTask(scope, id) ?? before;
+  const latest = store.readTask(scope, id) ?? before;
   if (latest.status !== before.status) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
   return { latest, refreshed };
 }
@@ -505,17 +519,18 @@ export async function runTasks(
   params: TaskRunArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
-  onActivity?: TaskActivityHandler,
+  onActivity: TaskActivityHandler | undefined,
+  store: TaskStore,
 ) {
-  const ids = taskIdsToRun(params, ctx);
+  const ids = taskIdsToRun(params, ctx, store);
   if (ids.length === 0) return textResult("No ready tasks to run.", { results: [] });
   const scope = taskStoreKey(ctx);
   const wantsParallel = ids.length > 1 && (params.parallel === true || (params.concurrency ?? 1) > 1);
   if (wantsParallel) {
     if (params.async === true) {
-      return textResult("Parallel async TaskRun is not supported yet because pi-subagents async-complete does not provide stable per-task ids. Run foreground parallel or omit parallel for detached per-task runs.", { results: [], tasks: ids.map((id) => taskStore.readTask(scope, id)) });
+      return textResult("Parallel async TaskRun is not supported yet because pi-subagents async-complete does not provide stable per-task ids. Run foreground parallel or omit parallel for detached per-task runs.", { results: [], tasks: ids.map((id) => store.readTask(scope, id)) });
     }
-    return runTasksInParallel(pi, ctx, ids, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data), onActivity);
+    return runTasksInParallel(pi, ctx, ids, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data), onActivity, store);
   }
 
   const lines: string[] = [];
@@ -525,18 +540,18 @@ export async function runTasks(
       lines.push("TaskRun aborted before remaining tasks started.");
       break;
     }
-    const task = taskStore.readTask(scope, id);
+    const task = store.readTask(scope, id);
     if (!task) {
       lines.push(`#${id}: not found`);
       continue;
     }
     const beforeStatus = task.status;
-    const line = await runOneTask(pi, ctx, task, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data), onActivity);
-    const latest = taskStore.readTask(scope, id);
+    const line = await runOneTask(pi, ctx, task, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data), onActivity, store);
+    const latest = store.readTask(scope, id);
     if (latest?.status === "completed" && beforeStatus !== "completed") completedCount += 1;
     lines.push(line);
   }
-  return textResult(`${lines.join("\n")}${completedCount > 0 ? completionFollowupHint(scope) : ""}`, { results: lines, tasks: ids.map((id) => taskStore.readTask(scope, id)) });
+  return textResult(`${lines.join("\n")}${completedCount > 0 ? completionFollowupHint(store, scope) : ""}`, { results: lines, tasks: ids.map((id) => store.readTask(scope, id)) });
 }
 
 export async function getTaskStatus(
@@ -545,11 +560,12 @@ export async function getTaskStatus(
   params: TaskStatusArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  store: TaskStore,
 ) {
   const scope = taskStoreKey(ctx);
   const id = taskId(params);
   if (!id) {
-    const allTasks = filterVisible(taskStore.readAll(scope));
+    const allTasks = filterVisible(store.readAll(scope));
     const tasks = sortedTasks(allTasks, { status: params.status, sort: "status" });
     const ready = readyTasks(allTasks).length;
     const active = allTasks.filter((task) => task.status === "in_progress").length;
@@ -559,10 +575,10 @@ export async function getTaskStatus(
     return textResult(lines.join("\n"), { tasks, ready, active, failed });
   }
 
-  const idBranch = await refreshAndSnapshot(pi, ctx, id, params.refresh !== false, signal, onTaskChanged);
+  const idBranch = await refreshAndSnapshot(pi, ctx, id, params.refresh !== false, signal, onTaskChanged, store);
   if (!idBranch.latest) return textResult(`Task #${id} not found.`, { task: null });
   const { latest, refreshed } = idBranch;
-  const lines = [formatTaskLine(latest, taskStore.readAll(scope))];
+  const lines = [formatTaskLine(latest, store.readAll(scope))];
   if (latest.run) lines.push(`run: ${latest.run.status} via ${latest.run.agent}${taskRunRefId(latest) ? ` (${taskRunRefId(latest)})` : ""}`);
   if (refreshed) lines.push(`refresh: ${firstLine(refreshed)}`);
   const statusHint = outputReadHint(runOutputPaths(latest.run?.subagent));
@@ -576,11 +592,12 @@ export async function getTaskOutput(
   params: TaskOutputArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  store: TaskStore,
 ) {
   const id = taskId(params);
   if (!id) throw new Error("taskId is required.");
   const scope = taskStoreKey(ctx);
-  const snapshot = await refreshAndSnapshot(pi, ctx, id, params.refresh !== false, signal, onTaskChanged);
+  const snapshot = await refreshAndSnapshot(pi, ctx, id, params.refresh !== false, signal, onTaskChanged, store);
   if (!snapshot.latest) return textResult(`Task #${id} not found.`, { task: null });
   const { latest, refreshed } = snapshot;
   const paths = runOutputPaths(latest.run?.subagent);
@@ -600,11 +617,12 @@ export async function stopTask(
   params: TaskIdArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  store: TaskStore,
 ) {
   const id = taskId(params);
   if (!id) throw new Error("taskId is required.");
   const scope = taskStoreKey(ctx);
-  const task = taskStore.readTask(scope, id);
+  const task = store.readTask(scope, id);
   if (!task) return textResult(`Task #${id} not found.`, { task: null });
   if (!task.run) return textResult(`Task #${id} has no run to stop.`, { task });
   const stoppable = task.status === "in_progress" && ["queued", "running", "detached"].includes(task.run.status);
@@ -622,8 +640,8 @@ export async function stopTask(
     message = "No pi-subagents run id was recorded; marking task cancelled locally.";
   }
   const status: TaskRunStatus = "cancelled";
-  const updated = taskStore.finishRun(scope, id, status, { summary: message, error: message });
-  taskStore.recordEvidence(scope, id, makeEvidence("note", `Cancelled: ${message}`, { source: "TaskStop" }));
+  const updated = store.finishRun(scope, id, status, { summary: message, error: message });
+  store.recordEvidence(scope, id, makeEvidence("note", `Cancelled: ${message}`, { source: "TaskStop" }));
   onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status });
   return textResult(`Task #${id} cancelled.\n\n${message}`, { task: updated });
 }
@@ -634,18 +652,19 @@ export async function resumeTask(
   params: TaskResumeArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  store: TaskStore,
 ) {
   const id = taskId(params);
   if (!id) throw new Error("taskId is required.");
   const scope = taskStoreKey(ctx);
-  const task = taskStore.readTask(scope, id);
+  const task = store.readTask(scope, id);
   if (!task) return textResult(`Task #${id} not found.`, { task: null });
   if (task.status === "in_progress") return textResult(`Task #${id} is already in_progress; wait for it or stop it before resuming.`, { task });
   const runId = taskRunRefId(task);
   if (!runId) return textResult(`Task #${id} has no pi-subagents run id to resume.`, { task });
   const agent = task.run?.agent ?? task.agent ?? "worker";
   const run = makeResumeRun(task, agent);
-  taskStore.startRun(scope, id, run);
+  store.startRun(scope, id, run);
   onTaskChanged(ctx, TASK_RUN_STARTED_EVENT, { taskId: id, runId: run.id, resumedFrom: runId });
   const message = params.message?.trim() || `Continue task #${task.id}: ${task.title}. Report updated output, proof, and residual risks.`;
   try {
@@ -654,7 +673,7 @@ export async function resumeTask(
     const summary = summarizeSubagentResponse(response);
     const subagent = subagentRefFromResponse(response.requestId, response, agent);
     const usage = usageFromResponse(response);
-    taskStore.completeRun(scope, id, status, {
+    store.completeRun(scope, id, status, {
       summary,
       error: status === "failed" ? response.errorText ?? summary : undefined,
       usage,
@@ -662,18 +681,12 @@ export async function resumeTask(
       evidenceMetadata: { source: "TaskResume", resumedFrom: runId },
     });
     onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, runId: run.id, status });
-    return textResult(`Task #${id} resumed: ${status}${status === "completed" ? completionFollowupHint(scope) : ""}`, { task: taskStore.readTask(scope, id) });
+    return textResult(`Task #${id} resumed: ${status}${status === "completed" ? completionFollowupHint(store, scope) : ""}`, { task: store.readTask(scope, id) });
   } catch (error) {
     const messageText = error instanceof Error ? error.message : String(error);
-    const cancelled = /cancelled|canceled|aborted/i.test(messageText);
-    const status: TaskRunStatus = cancelled ? "cancelled" : "failed";
-    taskStore.completeRun(scope, id, status, {
-      summary: messageText,
-      error: messageText,
-      evidenceMetadata: { source: "TaskResume", resumedFrom: runId },
-    });
-    onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, runId: run.id, status });
-    return textResult(`Task #${id} resume ${status}: ${messageText}`, { task: taskStore.readTask(scope, id) });
+    const status = classifyRunError(messageText);
+    recordFailedRun(store, scope, id, status, run.id, messageText, { source: "TaskResume", resumedFrom: runId }, (eventType, data) => onTaskChanged(ctx, eventType, data));
+    return textResult(`Task #${id} resume ${status}: ${messageText}`, { task: store.readTask(scope, id) });
   }
 }
 
@@ -683,18 +696,19 @@ export async function retryTask(
   params: TaskRetryArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
-  onActivity?: TaskActivityHandler,
+  onActivity: TaskActivityHandler | undefined,
+  store: TaskStore,
 ) {
   const id = taskId(params);
   if (!id) throw new Error("taskId is required.");
-  const task = taskStore.readTask(taskStoreKey(ctx), id);
+  const task = store.readTask(taskStoreKey(ctx), id);
   if (!task) return textResult(`Task #${id} not found.`, { task: null });
   if (!params.force && task.status !== "failed" && task.status !== "cancelled") {
     return textResult(`Task #${id} is ${task.status}; retry only failed/cancelled tasks unless force=true.`, { task });
   }
-  taskStore.recordEvidence(taskStoreKey(ctx), id, makeEvidence("note", "Retry requested.", { source: "TaskRetry" }));
+  store.recordEvidence(taskStoreKey(ctx), id, makeEvidence("note", "Retry requested.", { source: "TaskRetry" }));
   onTaskChanged(ctx, TASK_EVIDENCE_RECORDED_EVENT, { taskId: id });
-  return runTasks(pi, ctx, { ...params, taskId: id, force: true }, signal, onTaskChanged, onActivity);
+  return runTasks(pi, ctx, { ...params, taskId: id, force: true }, signal, onTaskChanged, onActivity, store);
 }
 
 export async function waitForTask(
@@ -703,6 +717,7 @@ export async function waitForTask(
   params: TaskWaitArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  store: TaskStore,
 ) {
   const id = taskId(params);
   if (!id) throw new Error("taskId is required.");
@@ -712,7 +727,7 @@ export async function waitForTask(
   const scope = taskStoreKey(ctx);
   let lastRefresh: string | undefined;
   while (Date.now() <= deadline) {
-    const task = taskStore.readTask(scope, id);
+    const task = store.readTask(scope, id);
     if (!task) return textResult(`Task #${id} not found.`, { task: null });
     if (isTerminalStatus(task.status)) {
       const waitHint = outputReadHint(runOutputPaths(task.run?.subagent));
@@ -721,8 +736,8 @@ export async function waitForTask(
     if (task.run?.subagent.asyncId || task.run?.status === "detached") {
       try {
         const before = task.status;
-        lastRefresh = await refreshAsyncStatus(pi, ctx, task, signal);
-        const latest = taskStore.readTask(scope, id) ?? task;
+        lastRefresh = await refreshAsyncStatus(pi, ctx, task, signal, store);
+        const latest = store.readTask(scope, id) ?? task;
         if (latest.status !== before) onTaskChanged(ctx, TASK_RUN_FINISHED_EVENT, { taskId: id, status: latest.status });
         if (isTerminalStatus(latest.status)) {
           const waitHint = outputReadHint(runOutputPaths(latest.run?.subagent));
@@ -734,6 +749,6 @@ export async function waitForTask(
     }
     await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())), signal);
   }
-  const task = taskStore.readTask(scope, id);
+  const task = store.readTask(scope, id);
   return textResult(`Timed out waiting for task #${id}.${lastRefresh ? `\n${firstLine(lastRefresh)}` : ""}`, { task, timedOut: true });
 }

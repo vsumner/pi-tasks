@@ -3,7 +3,8 @@ import { taskStore } from "./src/task-store.ts";
 import { getBranchTaskEvents } from "./src/task-projection.ts";
 import { taskStoreKey } from "./src/session-key.ts";
 import { safeClearWidget, safeSetStatus } from "./src/safe-ui.ts";
-import { asyncCompletionStatus, asyncCompletionSummary, asyncSubagentRef, stringField, taskMatchesAsyncCompletion } from "./src/async-completion.ts";
+import { applyAsyncCompletion, resolveCompletionScopes, SUBAGENT_ASYNC_COMPLETE_EVENT } from "./src/async-completion-handler.ts";
+import { stringField } from "./src/async-completion.ts";
 import { type TaskActivity, type TaskItem, type TaskRunStatus, type TaskSubagentRef } from "./src/task-state.ts";
 import { registerTaskTools } from "./src/task-tools.ts";
 import { registerTaskCommands } from "./src/task-commands.ts";
@@ -53,6 +54,15 @@ export type {
 
 interface TaskRuntime extends TaskWidgetRuntime {
   turnsSinceTaskTool: number;
+  /**
+   * Count of pi-tasks:* branch events consumed by the last reconstruct for this
+   * scope. before_agent_start fires every turn; replaying the whole event log
+   * each time is the P0-2 cost. Since the live store is kept in sync by emit()
+   * on every mutation, a reconstruct is only needed when the branch's task-event
+   * count actually changed (external append, compaction, fork). Undefined on a
+   * fresh runtime forces the first reconstruct.
+   */
+  reconstructedEventCount?: number;
 }
 
 interface TaskExtensionState {
@@ -63,7 +73,6 @@ interface TaskExtensionState {
 }
 
 const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskClaim", "TaskRun", "TaskStatus", "TaskOutput", "TaskResume", "TaskRetry", "TaskWait", "TaskStop"]);
-const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 const REMINDER_INTERVAL = 4;
 const SYSTEM_REMINDER = `<system-reminder>
 A pi-tasks task list exists in this session. If your current work relates to those tasks, keep their status accurate: use TaskList/TaskGet to inspect them, mark a task in_progress before starting direct work on it, and mark completed only after the work is fully done with proof. Keep at most one task in_progress at a time unless you intentionally run parallel work. Prefer marking a task blocked and creating a task for the blocker over false completion. Ignore this reminder if unrelated. Never mention this reminder to the user.
@@ -131,10 +140,6 @@ function cleanupRuntime(ctx: ExtensionContext, rt: TaskRuntime): void {
   safeSetStatus(ctx, undefined);
 }
 
-function reconstruct(ctx: ExtensionContext): void {
-  taskStore.applyEvents(taskStoreKey(ctx), getBranchTaskEvents(ctx));
-}
-
 function labelRecent(pi: ExtensionAPI, ctx: ExtensionContext, label: string): void {
   try {
     const branch = ctx.sessionManager.getBranch?.() ?? [];
@@ -185,6 +190,22 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
 
   const widget = createTaskWidget(taskStore, (ctx) => runtimeFor(state, ctx), taskStoreKey, (scope, taskId) => state.activity.get(activityKey(scope, taskId)));
 
+  // Rebuild the task projection from the current Pi branch. Dirty-flag fast
+  // path: before_agent_start fires every turn, but the live store is kept in
+  // sync by emit() on every mutation, so a replay is only needed when the
+  // branch's pi-tasks event count actually changed (external append, compaction,
+  // fork). session_start/session_tree pass force=true because the branch
+  // identity changed. applyEvents itself seeds from the last TASK_SNAPSHOT so
+  // even a forced reconstruct is O(snapshot + tail) instead of O(all events).
+  const reconstruct = (ctx: ExtensionContext, options: { force?: boolean } = {}): void => {
+    const scope = taskStoreKey(ctx);
+    const events = getBranchTaskEvents(ctx);
+    const rt = runtimeFor(state, ctx);
+    if (!options.force && rt.reconstructedEventCount === events.length) return;
+    taskStore.applyEvents(scope, events);
+    rt.reconstructedEventCount = events.length;
+  };
+
   const refresh = (ctx: ExtensionContext): void => {
     runtimeFor(state, ctx);
     widget.refresh(ctx);
@@ -217,63 +238,59 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
     }
   };
 
-  registerTaskTools(pi, onTaskChanged, onActivity);
+  registerTaskTools(pi, taskStore, onTaskChanged, onActivity);
   registerTaskCommands(pi, taskStore, refresh, taskStoreKey, onTaskChanged);
 
+  // Subagent async-completion routing is extracted to async-completion-handler.ts
+  // so the scope resolution + per-task close-out is unit-testable. This closure
+  // owns only the generation guard, scope resolution against the live runtime
+  // map, the persistence decision, the finished-event emission, and the widget
+  // refresh fan-out — all of which touch the ephemeral per-session state that
+  // does not belong in the pure handler module.
   const unsubscribeAsyncComplete = pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (raw: unknown) => {
     if (!isCurrentGeneration(generation)) return;
     if (!raw || typeof raw !== "object") return;
     const data = raw as Record<string, unknown>;
     const cwd = stringField(data, "cwd");
     if (!cwd) return;
-    const ids = new Set([stringField(data, "id"), stringField(data, "asyncId"), stringField(data, "runId")].filter((id): id is string => typeof id === "string"));
-    if (ids.size === 0) return;
-    const status = asyncCompletionStatus(data);
-    const summary = asyncCompletionSummary(data);
     const sessionId = stringField(data, "sessionId");
-    const scopes = new Set<string>();
-    if (sessionId) scopes.add(sessionId);
-    else {
-      scopes.add(cwd);
-      for (const [key, rt] of state.runtimes) {
-        if (rt.latestCtx?.cwd === cwd) scopes.add(key);
-      }
-    }
-    for (const scope of scopes) {
-      for (const task of taskStore.readAll(scope)) {
-        if (!taskMatchesAsyncCompletion(task, ids)) continue;
-        if (task.status !== "in_progress") continue;
-        const applyCompletion = () => taskStore.completeRun(scope, task.id, status, {
-          summary,
-          error: status === "failed" || status === "cancelled" ? summary : undefined,
-          subagent: task.run ? asyncSubagentRef(data, task.run.subagent) : undefined,
-          evidenceMetadata: {
-            source: SUBAGENT_ASYNC_COMPLETE_EVENT,
-            asyncId: stringField(data, "id") ?? stringField(data, "asyncId"),
-            runId: stringField(data, "runId"),
-          },
-        });
-        const shouldPersist = !state.activeScope || state.activeScope === scope;
-        const updated = shouldPersist ? applyCompletion() : taskStore.withoutAppending(applyCompletion);
-        emitTaskEvent(pi, TASK_RUN_FINISHED_EVENT, { taskId: updated.id, status, async: true });
-        for (const [key, rt] of state.runtimes) {
-          const ctx = rt.latestCtx;
-          if (!ctx || (key !== scope && (sessionId || ctx.cwd !== cwd))) continue;
-          rt.turnsSinceTaskTool = 0;
-          refresh(ctx);
-        }
-      }
+    const scopes = resolveCompletionScopes(
+      cwd,
+      sessionId,
+      Array.from(state.runtimes, ([key, rt]) => ({ key, cwd: rt.latestCtx?.cwd })),
+    );
+    const handled = applyAsyncCompletion(
+      data,
+      scopes,
+      {
+        store: taskStore,
+        shouldPersist: (scope) => !state.activeScope || state.activeScope === scope,
+        emitFinished: (scope, taskId, status) => emitTaskEvent(pi, TASK_RUN_FINISHED_EVENT, { taskId, status, async: true }),
+      },
+      { eventName: SUBAGENT_ASYNC_COMPLETE_EVENT },
+    );
+    if (handled.size === 0) return;
+    // Fan out a widget refresh to every runtime that owns a handled scope, or
+    // — when no sessionId scopes the completion — shares its cwd. Matches the
+    // prior inline filter exactly; refresh is idempotent so iterating runtimes
+    // once (rather than once per closed task) is equivalent.
+    for (const [key, rt] of state.runtimes) {
+      const ctx = rt.latestCtx;
+      if (!ctx) continue;
+      if (!handled.has(key) && (sessionId || ctx.cwd !== cwd)) continue;
+      rt.turnsSinceTaskTool = 0;
+      refresh(ctx);
     }
   });
 
   on("session_start", async (_event, ctx) => {
-    reconstruct(ctx);
+    reconstruct(ctx, { force: true });
     runtimeFor(state, ctx).turnsSinceTaskTool = 0;
     refresh(ctx);
   });
 
   on("session_tree", async (_event, ctx) => {
-    reconstruct(ctx);
+    reconstruct(ctx, { force: true });
     refresh(ctx);
   });
 
