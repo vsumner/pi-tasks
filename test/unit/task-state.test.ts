@@ -1,7 +1,37 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TASK_CLEARED_EVENT, TASK_CREATED_EVENT, TASK_EVIDENCE_RECORDED_EVENT, TASK_RUN_FINISHED_EVENT, TASK_RUN_STARTED_EVENT, TASK_STATUS_UPDATED_EVENT, TASK_UPDATED_EVENT } from "../../src/extension/src/events.ts";
+import { TASK_CLEARED_EVENT, TASK_CREATED_EVENT, TASK_EVIDENCE_RECORDED_EVENT, TASK_RUN_FINISHED_EVENT, TASK_RUN_STARTED_EVENT, TASK_SNAPSHOT_EVENT, TASK_STATUS_UPDATED_EVENT, TASK_UPDATED_EVENT } from "../../src/extension/src/events.ts";
 import { createTask, evaluateClaim, projectTasksFromEvents, readyTasks, type TaskRunRecord } from "../../src/extension/src/task-state.ts";
+
+test("snapshot anchors state so dropped earlier events survive compaction-style replay", () => {
+  // Simulate a pre-compaction branch: create 1, 2, 3; advance 1 to in_progress.
+  const task1 = createTask({ title: "Setup", prompt: "Do setup" }, "1");
+  const task2 = createTask({ title: "Build", prompt: "Do build" }, "2");
+  const task3 = createTask({ title: "Ship", prompt: "Do ship" }, "3");
+  const fullBranch = [
+    { type: "custom", customType: TASK_CREATED_EVENT, data: { taskId: "1", task: task1 }, ts: "2026-01-01T00:00:00.000Z" },
+    { type: "custom", customType: TASK_CREATED_EVENT, data: { taskId: "2", task: task2 }, ts: "2026-01-01T00:00:01.000Z" },
+    { type: "custom", customType: TASK_CREATED_EVENT, data: { taskId: "3", task: task3 }, ts: "2026-01-01T00:00:02.000Z" },
+    { type: "custom", customType: TASK_STATUS_UPDATED_EVENT, data: { taskId: "1", status: "in_progress" }, ts: "2026-01-01T00:00:03.000Z" },
+  ];
+  // The compaction handler appends a snapshot capturing full state at the tail.
+  const snapshotTasks = projectTasksFromEvents(fullBranch).map((task) => ({ ...task }));
+  const snapshotEvent = { type: "custom", customType: TASK_SNAPSHOT_EVENT, data: { tasks: snapshotTasks }, ts: "2026-01-01T00:00:04.000Z" };
+  // A post-snapshot task created in the next turn.
+  const task4 = createTask({ title: "Doc", prompt: "Write docs" }, "4");
+  const postSnapshot = { type: "custom", customType: TASK_CREATED_EVENT, data: { taskId: "4", task: task4 }, ts: "2026-01-01T00:00:05.000Z" };
+
+  // Post-compaction replay: summarized span (creates + status) removed;
+  // only [snapshot, post-snapshot create] survive.
+  const rebuilt = projectTasksFromEvents([snapshotEvent, postSnapshot]);
+
+  assert.equal(rebuilt.length, 4);
+  const byId = new Map(rebuilt.map((task) => [task.id, task]));
+  assert.equal(byId.get("1")?.status, "in_progress");
+  assert.equal(byId.get("2")?.status, "pending");
+  assert.equal(byId.get("3")?.status, "pending");
+  assert.equal(byId.get("4")?.status, "pending");
+});
 
 test("projects created tasks and ready dependency order", () => {
   const first = createTask({ title: "Setup", prompt: "Do setup" }, "1");

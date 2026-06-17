@@ -5,7 +5,7 @@ import { taskStore, type TaskEvent, type TaskRunRecord } from "../../src/extensi
 
 type Handler = (data: unknown) => void;
 
-function createEventBus(options: { parallelResultCount?: number; statusText?: string } = {}) {
+function createEventBus(options: { parallelResultCount?: number; statusText?: string; emitUpdate?: boolean } = {}) {
   const handlers = new Map<string, Set<Handler>>();
   const requests: unknown[] = [];
   return {
@@ -23,11 +23,19 @@ function createEventBus(options: { parallelResultCount?: number; statusText?: st
       if (event === "subagent:slash:request") {
         requests.push(data);
         const request = data as { requestId: string; params?: Record<string, unknown> };
+        const children = Array.isArray(request.params?.tasks) ? request.params.tasks as Array<Record<string, unknown>> : [];
         for (const handler of handlers.get("subagent:slash:started") ?? []) handler({ requestId: request.requestId });
+        // When emitUpdate is set, stream a per-child progress update before the
+        // final response, simulating pi-subagents' parallel progress fanout.
+        if (options.emitUpdate && children.length > 0) {
+          const progress = children.map((child, index) => ({ index, agent: child.agent, currentTool: index === 0 ? "read" : "edit", toolCount: (index + 1) * 2 }));
+          for (const handler of handlers.get("subagent:slash:update") ?? []) handler({ requestId: request.requestId, progress });
+        } else if (options.emitUpdate) {
+          for (const handler of handlers.get("subagent:slash:update") ?? []) handler({ requestId: request.requestId, progress: [{ index: 0, agent: "worker", currentTool: "read", toolCount: 1 }] });
+        }
         const isInterrupt = request.params?.action === "interrupt";
         const isResume = request.params?.action === "resume";
         const isStatus = request.params?.action === "status";
-        const children = Array.isArray(request.params?.tasks) ? request.params.tasks as Array<Record<string, unknown>> : [];
         const text = isInterrupt ? "Async run not found" : isResume ? "Resume complete" : isStatus ? options.statusText ?? "State: complete" : children.length ? "Parallel complete" : "State: complete";
         const parallelResults = children.map((child, index) => ({ agent: child.agent as string, exitCode: 0, finalOutput: `parallel output ${index + 1}`, savedOutputPath: `/tmp/out-${index + 1}.md` }));
         const limitedParallelResults = typeof options.parallelResultCount === "number" ? parallelResults.slice(0, options.parallelResultCount) : parallelResults;
@@ -53,15 +61,18 @@ function createEventBus(options: { parallelResultCount?: number; statusText?: st
   };
 }
 
-function createHarness(options: { parallelResultCount?: number; statusText?: string } = {}) {
+function createHarness(options: { parallelResultCount?: number; statusText?: string; emitUpdate?: boolean } = {}) {
   const tools = new Map<string, any>();
   const events = createEventBus(options);
   const pi = {
     registerTool(tool: { name: string }) { tools.set(tool.name, tool); },
     events,
   };
-  registerTaskTools(pi as any, () => {});
-  return { tools, events };
+  const activityCalls: Array<{ taskId: string; tool?: string; count: number }> = [];
+  registerTaskTools(pi as any, () => {}, (_scope, taskId, activity) => {
+    activityCalls.push({ taskId, tool: activity.tool, count: activity.count });
+  });
+  return { tools, events, activityCalls };
 }
 
 function createCtx() {
@@ -296,6 +307,52 @@ test("TaskUpdate completion result nudges the agent to list newly ready work", a
   assert.equal(taskStore.readTask("session-1", target.id)?.status, "pending");
 });
 
+test("TaskUpdate verification nudge fires when closing out 3+ tasks without a verify step", async () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+  const a = taskStore.createTask("session-1", { title: "A", prompt: "pa", cwd: "/repo" });
+  const b = taskStore.createTask("session-1", { title: "B", prompt: "pb", cwd: "/repo" });
+  const c = taskStore.createTask("session-1", { title: "C", prompt: "pc", cwd: "/repo" });
+  const { tools } = createHarness();
+  await tools.get("TaskUpdate").execute("c1", { taskId: a.id, status: "completed" }, undefined, undefined, createCtx());
+  await tools.get("TaskUpdate").execute("c2", { taskId: b.id, status: "completed" }, undefined, undefined, createCtx());
+  const last = await tools.get("TaskUpdate").execute("c3", { taskId: c.id, status: "completed" }, undefined, undefined, createCtx());
+  assert.match(last.content[0].text, /verify the work/i);
+  assert.match(last.content[0].text, /fresh-eyes/);
+  assert.doesNotMatch(last.content[0].text, /confirm no ready follow-up work remains/);
+});
+
+test("TaskUpdate verification nudge is suppressed when a task carried a verify step", async () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+  const a = taskStore.createTask("session-1", { title: "A", prompt: "pa", cwd: "/repo" });
+  const b = taskStore.createTask("session-1", { title: "B", prompt: "pb", cwd: "/repo" });
+  taskStore.createTask("session-1", {
+    title: "C",
+    prompt: "pc",
+    cwd: "/repo",
+    acceptance: { verify: [{ id: "v1", command: "npm test" }] },
+  });
+  const { tools } = createHarness();
+  await tools.get("TaskUpdate").execute("c1", { taskId: a.id, status: "completed" }, undefined, undefined, createCtx());
+  await tools.get("TaskUpdate").execute("c2", { taskId: b.id, status: "completed" }, undefined, undefined, createCtx());
+  const last = await tools.get("TaskUpdate").execute("c3", { taskId: "3", status: "completed" }, undefined, undefined, createCtx());
+  assert.doesNotMatch(last.content[0].text, /verify the work/i);
+  assert.match(last.content[0].text, /confirm no ready follow-up work remains/);
+});
+
+test("TaskUpdate verification nudge does not fire below the 3-task threshold", async () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+  const a = taskStore.createTask("session-1", { title: "A", prompt: "pa", cwd: "/repo" });
+  const b = taskStore.createTask("session-1", { title: "B", prompt: "pb", cwd: "/repo" });
+  const { tools } = createHarness();
+  await tools.get("TaskUpdate").execute("c1", { taskId: a.id, status: "completed" }, undefined, undefined, createCtx());
+  const last = await tools.get("TaskUpdate").execute("c2", { taskId: b.id, status: "completed" }, undefined, undefined, createCtx());
+  assert.doesNotMatch(last.content[0].text, /verify the work/i);
+  assert.match(last.content[0].text, /confirm no ready follow-up work remains/);
+});
+
 test("TaskStop does not cancel a completed task when interrupt fails", async () => {
   const events: TaskEvent[] = [];
   taskStore.reset();
@@ -439,6 +496,24 @@ test("TaskRun foreground parallel maps ordered child results to tasks", async ()
   assert.equal(taskStore.readTask("session-1", first.id)?.run?.output, "parallel output 1");
   assert.equal(taskStore.readTask("session-1", second.id)?.run?.output, "parallel output 2");
   assert.deepEqual(taskStore.readTask("session-1", first.id)?.run?.subagent.savedOutputs, ["/tmp/out-1.md"]);
+});
+
+test("TaskRun parallel fans out per-child activity so each task gets its own live line", async () => {
+  taskStore.reset();
+  taskStore.setEventAppender(() => {});
+  const a = taskStore.createTask("session-1", { title: "A", prompt: "pa", cwd: "/repo" });
+  const b = taskStore.createTask("session-1", { title: "B", prompt: "pb", cwd: "/repo" });
+  const { tools, activityCalls } = createHarness({ emitUpdate: true });
+
+  await tools.get("TaskRun").execute("call-1", { task_ids: [a.id, b.id], parallel: true, concurrency: 2 }, undefined, undefined, createCtx());
+
+  // The harness emits a slash:update with progress[{index:0, currentTool:"read", toolCount:2}, {index:1, currentTool:"edit", toolCount:4}].
+  // Each child task should have received its own onActivity call with its tool/count.
+  const byTask = new Map(activityCalls.map((entry) => [entry.taskId, entry]));
+  assert.equal(byTask.get(a.id)?.tool, "read");
+  assert.equal(byTask.get(a.id)?.count, 2);
+  assert.equal(byTask.get(b.id)?.tool, "edit");
+  assert.equal(byTask.get(b.id)?.count, 4);
 });
 
 test("TaskRun foreground parallel marks missing child results as failed", async () => {

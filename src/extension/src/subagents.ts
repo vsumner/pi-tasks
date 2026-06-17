@@ -97,9 +97,19 @@ export interface SlashSubagentResponseLike {
 
 export interface SlashSubagentUpdateLike {
   requestId?: string;
-  progress?: unknown[];
+  progress?: AgentProgressLike[];
   currentTool?: string;
   toolCount?: number;
+}
+
+/** Per-child progress entry streamed by pi-subagents in updates and responses. */
+export interface AgentProgressLike {
+  index: number;
+  agent?: string;
+  currentTool?: string;
+  toolCount?: number;
+  status?: string;
+  [key: string]: unknown;
 }
 
 export interface SubagentBridgeCallbacks {

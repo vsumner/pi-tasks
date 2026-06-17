@@ -8,7 +8,7 @@ import {
   renderLines,
   type Theme,
 } from "../../src/extension/src/widget.ts";
-import { createTask, type TaskItem, type TaskStatus } from "../../src/extension/src/task-state.ts";
+import { createTask, type TaskActivity, type TaskItem, type TaskStatus } from "../../src/extension/src/task-state.ts";
 
 const passthroughTheme: Theme = {
   fg: (_color, text) => text,
@@ -166,6 +166,51 @@ test("renderLines keeps Pi-specific ready and failed counts in the header", () =
 test("renderLines renders nothing when only stale completed tasks remain", () => {
   const stale = [task("1", "completed", { updatedAt: EPOCH })];
   assert.deepEqual(renderLines(stale, passthroughTheme, 0, 200), []);
+});
+
+test("renderLines surfaces a Next: hint for the lowest-ID ready task when idle", () => {
+  const tasks = [
+    task("3", "pending"),
+    task("1", "pending", { activeForm: "Doing task one" }),
+  ];
+  const lines = renderLines(tasks, passthroughTheme, 0, 200);
+  const nextLine = lines.at(-1);
+  assert.ok(nextLine, "expected a rendered line");
+  assert.match(nextLine!, /Next: Doing task one/);
+});
+
+test("renderLines suppresses the Next: hint while a task is in_progress", () => {
+  const tasks = [
+    task("1", "in_progress"),
+    task("2", "pending", { activeForm: "Doing task two" }),
+  ];
+  const lines = renderLines(tasks, passthroughTheme, 0, 200);
+  assert.ok(!lines.some((line) => /Next:/.test(line)));
+});
+
+test("renderLines shows a live activity line for an in_progress task with fresh activity", () => {
+  const tasks = [task("1", "in_progress", { activeForm: "Building feature" })];
+  const activity = new Map<string, TaskActivity>([["1", { tool: "read", count: 3, ts: Date.now() }]]);
+  const lines = renderLines(tasks, passthroughTheme, 0, 200, activity);
+  assert.ok(lines.some((line) => /read · 3 tools…/.test(line)));
+});
+
+test("renderLines suppresses the activity line when activity is stale", () => {
+  const tasks = [task("1", "in_progress", { activeForm: "Building feature" })];
+  const stale: TaskActivity = { tool: "read", count: 3, ts: Date.now() - 120_000 };
+  const activity = new Map<string, TaskActivity>([["1", stale]]);
+  const lines = renderLines(tasks, passthroughTheme, 0, 200, activity);
+  assert.ok(!lines.some((line) => /read · 3 tools…/.test(line)));
+});
+
+test("renderLines never shows an activity line for non-in_progress tasks", () => {
+  const tasks = [task("1", "pending"), task("2", "completed", { updatedAt: new Date().toISOString() })];
+  const activity = new Map<string, TaskActivity>([
+    ["1", { tool: "read", count: 1, ts: Date.now() }],
+    ["2", { tool: "read", count: 1, ts: Date.now() }],
+  ]);
+  const lines = renderLines(tasks, passthroughTheme, 0, 200, activity);
+  assert.ok(!lines.some((line) => /read · 1 tool…/.test(line)));
 });
 
 test("renderLines shows a compact output-saved hint for completed async runs", () => {

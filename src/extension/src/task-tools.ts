@@ -23,10 +23,11 @@ import {
   usageFromResult,
   type SubagentParamsLike,
   type SubagentSingleResultLike,
+  type AgentProgressLike,
 } from "./subagents.ts";
 import { taskStore, type TaskUpdateInput } from "./task-store.ts";
 import { taskStoreKey } from "./session-key.ts";
-import { makeEvidence, readyTasks, type TaskAcceptance, type TaskItem, type TaskRunRecord, type TaskRunStatus, type TaskStatus } from "./task-state.ts";
+import { makeEvidence, readyTasks, type TaskAcceptance, type TaskActivity, type TaskActivityHandler, type TaskItem, type TaskRunRecord, type TaskRunStatus, type TaskStatus } from "./task-state.ts";
 
 function StringEnum<T extends readonly string[]>(values: T, options?: { description?: string; default?: T[number] }): TUnsafe<T[number]> {
   return Type.Unsafe<T[number]>({
@@ -346,9 +347,32 @@ function activeFormHint(activeForm: string | undefined): string {
     : "\nTip: set activeForm to a present-continuous label (e.g. 'Running tests') so the task shows useful progress while in_progress.";
 }
 
+function hasVerificationEvidence(task: TaskItem): boolean {
+  if (task.evidence.some((e) => e.kind === "proof" || e.kind === "review" || e.passed === true)) {
+    return true;
+  }
+  const acc = task.acceptance;
+  if (!acc) return false;
+  if (typeof acc === "string") return acc === "verified" || acc === "checked" || acc === "reviewed";
+  return (
+    acc.level === "verified" ||
+    acc.level === "checked" ||
+    acc.level === "reviewed" ||
+    (Array.isArray(acc.verify) && acc.verify.length > 0)
+  );
+}
+
 function completionFollowupHint(scope: string): string {
   const all = taskStore.readAll(scope);
   const ready = readyTasks(all);
+  const openWork = all.some((task) => !terminalTaskStatus(task.status));
+  // Structural verification nudge (mirrors claude-src TodoWriteTool's close-out
+  // nudge): when the session just closed out 3+ tasks and none recorded a
+  // verification step, push the model to verify before summarizing rather than
+  // self-certifying via caveats. Kept as a tool-result hint, not a hard block.
+  if (!openWork && all.length >= 3 && !all.some(hasVerificationEvidence)) {
+    return "\n\nAll tasks are closed. You closed 3+ tasks without recording a verification step — before writing a final summary, verify the work: run the proof commands from acceptance.verify (or load the fresh-eyes skill) and record the outcome as proof evidence. Do not self-certify completion by listing caveats in your summary.";
+  }
   if (ready.length === 0) return "\n\nTask completed. Call TaskList now to confirm no ready follow-up work remains.";
   const shown = ready.slice(0, 5).map((task) => `#${task.id}`).join(", ");
   const more = ready.length > 5 ? `, +${ready.length - 5} more` : "";
@@ -381,6 +405,7 @@ async function runOneTask(
   args: TaskRunArgs,
   signal: AbortSignal | undefined,
   onChange: (eventType: string, data?: Record<string, unknown>) => void,
+  onActivity?: TaskActivityHandler,
 ): Promise<string> {
   const scope = taskStoreKey(ctx);
   const all = taskStore.readAll(scope);
@@ -402,6 +427,8 @@ async function runOneTask(
     context: args.context ?? "fresh",
     async: args.async ?? false,
     clarify: false,
+    // Stream per-tool progress so the widget's live activity line updates.
+    includeProgress: true,
     artifacts: true,
     ...(args.model ? { model: args.model } : {}),
     ...(args.output !== undefined ? { output: args.output } : {}),
@@ -418,8 +445,16 @@ async function runOneTask(
         try { ctx.ui.setStatus("pi-tasks", `Task #${task.id} running via ${agent}`); } catch { /* stale UI */ }
       },
       onUpdate: (update) => {
-        const tool = update.currentTool ? ` ${update.currentTool}` : "";
-        try { ctx.ui.setStatus("pi-tasks", `Task #${task.id}: ${update.toolCount ?? 0} tools${tool}`); } catch { /* stale UI */ }
+        // Prefer the per-run progress entry (index 0 for single runs) over the
+        // legacy top-level currentTool/toolCount fields.
+        const p = update.progress?.[0];
+        const tool = (p?.currentTool ?? update.currentTool) ? ` ${p?.currentTool ?? update.currentTool}` : "";
+        const count = p?.toolCount ?? update.toolCount ?? 0;
+        try { ctx.ui.setStatus("pi-tasks", `Task #${task.id}: ${count} tools${tool}`); } catch { /* stale UI */ }
+        // Route live activity into the per-task widget line (swarm-feel).
+        // Ephemeral runtime state; never appended to session events.
+        const toolName = p?.currentTool ?? update.currentTool;
+        if (toolName || count > 0) onActivity?.(scope, task.id, { tool: toolName, count, ts: Date.now() });
       },
     });
 
@@ -463,6 +498,7 @@ async function runTasksInParallel(
   args: TaskRunArgs,
   signal: AbortSignal | undefined,
   onChange: (eventType: string, data?: Record<string, unknown>) => void,
+  onActivity?: TaskActivityHandler,
 ) {
   const scope = taskStoreKey(ctx);
   const all = taskStore.readAll(scope);
@@ -495,6 +531,8 @@ async function runTasksInParallel(
     async: false,
     clarify: false,
     artifacts: true,
+    // Stream per-child progress so each parallel task gets its own activity line.
+    includeProgress: true,
     concurrency: Math.max(1, Math.floor(args.concurrency ?? runnable.length)),
   };
 
@@ -504,8 +542,22 @@ async function runTasksInParallel(
         try { ctx.ui.setStatus("pi-tasks", `Running ${runnable.length} tasks in parallel`); } catch { /* stale UI */ }
       },
       onUpdate: (update) => {
-        const tool = update.currentTool ? ` ${update.currentTool}` : "";
-        try { ctx.ui.setStatus("pi-tasks", `Parallel tasks: ${update.toolCount ?? 0} tools${tool}`); } catch { /* stale UI */ }
+        // Parallel updates carry a per-child progress array (each entry has its
+        // own index). Fan out an onActivity call per child so every parallel
+        // task shows its own live tool line, not one global aggregate.
+        const entries = update.progress ?? [];
+        if (entries.length > 0) {
+          for (const entry of entries) {
+            const child = runnable[entry.index];
+            if (!child) continue;
+            onActivity?.(scope, child.task.id, { tool: entry.currentTool, count: entry.toolCount ?? 0, ts: Date.now() });
+          }
+          const totalTools = entries.reduce((sum, e) => sum + (e.toolCount ?? 0), 0);
+          try { ctx.ui.setStatus("pi-tasks", `Parallel: ${runnable.length} tasks · ${totalTools} tools`); } catch { /* stale UI */ }
+        } else {
+          const tool = update.currentTool ? ` ${update.currentTool}` : "";
+          try { ctx.ui.setStatus("pi-tasks", `Parallel tasks: ${update.toolCount ?? 0} tools${tool}`); } catch { /* stale UI */ }
+        }
       },
     });
     const overall = summarizeSubagentResponse(response);
@@ -599,6 +651,7 @@ export async function runTasks(
   params: TaskRunArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  onActivity?: TaskActivityHandler,
 ) {
   const ids = taskIdsToRun(params, ctx);
   if (ids.length === 0) return textResult("No ready tasks to run.", { results: [] });
@@ -608,7 +661,7 @@ export async function runTasks(
     if (params.async === true) {
       return textResult("Parallel async TaskRun is not supported yet because pi-subagents async-complete does not provide stable per-task ids. Run foreground parallel or omit parallel for detached per-task runs.", { results: [], tasks: ids.map((id) => taskStore.readTask(scope, id)) });
     }
-    return runTasksInParallel(pi, ctx, ids, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data));
+    return runTasksInParallel(pi, ctx, ids, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data), onActivity);
   }
 
   const lines: string[] = [];
@@ -624,7 +677,7 @@ export async function runTasks(
       continue;
     }
     const beforeStatus = task.status;
-    const line = await runOneTask(pi, ctx, task, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data));
+    const line = await runOneTask(pi, ctx, task, params, signal, (eventType, data) => onTaskChanged(ctx, eventType, data), onActivity);
     const latest = taskStore.readTask(scope, id);
     if (latest?.status === "completed" && beforeStatus !== "completed") completedCount += 1;
     lines.push(line);
@@ -778,6 +831,7 @@ export async function retryTask(
   params: TaskRetryArgs,
   signal: AbortSignal | undefined,
   onTaskChanged: TaskChangeHandler,
+  onActivity?: TaskActivityHandler,
 ) {
   const id = taskId(params);
   if (!id) throw new Error("taskId is required.");
@@ -788,7 +842,7 @@ export async function retryTask(
   }
   taskStore.recordEvidence(taskStoreKey(ctx), id, makeEvidence("note", "Retry requested.", { source: "TaskRetry" }));
   onTaskChanged(ctx, TASK_EVIDENCE_RECORDED_EVENT, { taskId: id });
-  return runTasks(pi, ctx, { ...params, taskId: id, force: true }, signal, onTaskChanged);
+  return runTasks(pi, ctx, { ...params, taskId: id, force: true }, signal, onTaskChanged, onActivity);
 }
 
 export async function waitForTask(
@@ -835,6 +889,7 @@ export async function waitForTask(
 export function registerTaskTools(
   pi: ExtensionAPI,
   onTaskChanged: (ctx: ExtensionContext, eventType: string, data?: Record<string, unknown>) => void,
+  onActivity?: TaskActivityHandler,
 ): void {
   pi.registerTool({
     name: "TaskCreate",
@@ -1016,7 +1071,7 @@ export function registerTaskTools(
     parameters: TaskRunParams,
     executionMode: "sequential",
     async execute(_id, params: TaskRunArgs, signal, _onUpdate, ctx) {
-      return runTasks(pi, ctx, params, signal ?? undefined, onTaskChanged);
+      return runTasks(pi, ctx, params, signal ?? undefined, onTaskChanged, onActivity);
     },
   });
 
@@ -1060,7 +1115,7 @@ export function registerTaskTools(
     parameters: TaskRetryParams,
     executionMode: "sequential",
     async execute(_id, params: TaskRetryArgs, signal, _onUpdate, ctx) {
-      return retryTask(pi, ctx, params, signal ?? undefined, onTaskChanged);
+      return retryTask(pi, ctx, params, signal ?? undefined, onTaskChanged, onActivity);
     },
   });
 

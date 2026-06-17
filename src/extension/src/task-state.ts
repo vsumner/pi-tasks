@@ -79,6 +79,22 @@ export interface TaskRunRecord {
   subagent: TaskSubagentRef;
 }
 
+/**
+ * Ephemeral live-activity snapshot for an in_progress task run, fed by the
+ * pi-subagents update channel (subagent:slash:update). This is runtime display
+ * state only — it is never appended to session events (doing so would flood
+ * the session and re-trigger compaction churn). Mirrors claude-src's
+ * per-teammate recentActivities rollup line.
+ */
+export interface TaskActivity {
+  tool?: string;
+  count: number;
+  ts: number;
+}
+
+/** Handler that records live activity for a task. Scope is the task-store key (session id or cwd). */
+export type TaskActivityHandler = (scope: string, taskId: string, activity: TaskActivity) => void;
+
 export interface TaskItem {
   id: string;
   title: string;

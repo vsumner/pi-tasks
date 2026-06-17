@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { taskStore } from "./src/task-store.ts";
 import { getBranchTaskEvents } from "./src/task-projection.ts";
 import { taskStoreKey } from "./src/session-key.ts";
-import { makeEvidence, type TaskItem, type TaskRunStatus, type TaskSubagentRef } from "./src/task-state.ts";
+import { makeEvidence, type TaskActivity, type TaskItem, type TaskRunStatus, type TaskSubagentRef } from "./src/task-state.ts";
 import { registerTaskTools } from "./src/task-tools.ts";
 import { registerTaskCommands } from "./src/task-commands.ts";
 import { createTaskWidget, type TaskWidgetRuntime } from "./src/widget.ts";
@@ -56,6 +56,8 @@ interface TaskRuntime extends TaskWidgetRuntime {
 interface TaskExtensionState {
   runtimes: Map<string, TaskRuntime>;
   activeScope?: string;
+  /** Ephemeral per-task live activity, keyed by `${scope}:${taskId}`. */
+  activity: Map<string, TaskActivity>;
 }
 
 const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskClaim", "TaskRun", "TaskStatus", "TaskOutput", "TaskResume", "TaskRetry", "TaskWait", "TaskStop"]);
@@ -81,9 +83,10 @@ function getOrCreateState(): TaskExtensionState {
   cleanupPreviousHandlers();
   let state = globalStore[STATE_KEY] as TaskExtensionState | undefined;
   if (!state) {
-    state = { runtimes: new Map() };
+    state = { runtimes: new Map(), activity: new Map() };
     globalStore[STATE_KEY] = state;
   }
+  if (!state.activity) state.activity = new Map();
   return state;
 }
 
@@ -145,6 +148,19 @@ function labelRecent(pi: ExtensionAPI, ctx: ExtensionContext, label: string): vo
 
 function emitTaskEvent(pi: ExtensionAPI, eventType: string, data: Record<string, unknown>): void {
   try { pi.events.emit(eventType, data); } catch { /* best effort */ }
+}
+
+/** Composite key for ephemeral per-task activity (scope-scoped). */
+function activityKey(scope: string, taskId: string): string {
+  return `${scope}\u0000${taskId}`;
+}
+
+function recordActivity(state: TaskExtensionState, scope: string, taskId: string, activity: TaskActivity): void {
+  state.activity.set(activityKey(scope, taskId), activity);
+}
+
+function clearActivity(state: TaskExtensionState, scope: string, taskId: string): void {
+  state.activity.delete(activityKey(scope, taskId));
 }
 
 function stringField(obj: Record<string, unknown>, key: string): string | undefined {
@@ -215,11 +231,20 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
     pi.appendEntry(event.customType ?? event.type, event.data ?? {});
   });
 
-  const widget = createTaskWidget(taskStore, (ctx) => runtimeFor(state, ctx), taskStoreKey);
+  const widget = createTaskWidget(taskStore, (ctx) => runtimeFor(state, ctx), taskStoreKey, (scope, taskId) => state.activity.get(activityKey(scope, taskId)));
 
   const refresh = (ctx: ExtensionContext): void => {
     runtimeFor(state, ctx);
     widget.refresh(ctx);
+  };
+
+  // Record live run activity into ephemeral state so the widget's activity
+  // line updates. The widget's in_progress timer (150ms) re-renders and picks
+  // this up, so no explicit refresh is needed per tool call. Scope is passed
+  // explicitly from the runner so activity lands on the correct session even
+  // if activeScope drifts (parallel/background contexts).
+  const onActivity = (scope: string, taskId: string, activity: TaskActivity): void => {
+    recordActivity(state, scope, taskId, activity);
   };
 
   const onTaskChanged = (ctx: ExtensionContext, eventType: string, data: Record<string, unknown> = {}): void => {
@@ -227,6 +252,11 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
     rt.turnsSinceTaskTool = 0;
     refresh(ctx);
     emitTaskEvent(pi, eventType, data);
+    // Clear ephemeral activity when a run finishes or a task is deleted so the
+    // live-tool line does not linger on a terminal row.
+    if (typeof data.taskId === "string" && (eventType === TASK_RUN_FINISHED_EVENT || eventType === TASK_DELETED_EVENT)) {
+      clearActivity(state, taskStoreKey(ctx), data.taskId);
+    }
     if (eventType === TASK_CREATED_EVENT && typeof data.taskId === "string") labelRecent(pi, ctx, `task: #${data.taskId}`);
     if (eventType === TASK_RUN_FINISHED_EVENT && typeof data.taskId === "string") {
       if (data.status === "completed") labelRecent(pi, ctx, `task done: #${data.taskId}`);
@@ -235,7 +265,7 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
     }
   };
 
-  registerTaskTools(pi, onTaskChanged);
+  registerTaskTools(pi, onTaskChanged, onActivity);
   registerTaskCommands(pi, taskStore, refresh, taskStoreKey, onTaskChanged);
 
   const unsubscribeAsyncComplete = pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (raw: unknown) => {
@@ -311,6 +341,27 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
     refresh(ctx);
   });
 
+  // Compaction durability: compaction removes entries before
+  // firstKeptEntryId (the summarized span), including pi-tasks:* events that
+  // hold canonical task state. The session-entry model survives restarts, but
+  // NOT compaction, unless we anchor full state in the kept region. Appending a
+  // TASK_SNAPSHOT here lands it at the tail (index >= firstKeptEntryId), so it
+  // survives compaction. The projection treats a snapshot as a reset anchor,
+  // so replaying the post-compaction branch rebuilds full state even though
+  // earlier task events were summarized away. Best-effort: a failure here must
+  // not block compaction or crash the session.
+  on("session_before_compact", async (_event, ctx) => {
+    try {
+      const scope = taskStoreKey(ctx);
+      const tasks = taskStore.readAll(scope);
+      if (tasks.length === 0) return undefined;
+      taskStore.snapshot(scope);
+    } catch {
+      // Never block compaction on a snapshot failure.
+    }
+    return undefined;
+  });
+
   on("tool_execution_start", async (_event, ctx) => refresh(ctx));
   on("message_update", async (_event, ctx) => refresh(ctx));
   on("agent_end", async (_event, ctx) => refresh(ctx));
@@ -352,6 +403,7 @@ export default function piTasksExtension(pi: ExtensionAPI): void {
       if (rt.widgetTimer) clearInterval(rt.widgetTimer);
       rt.widgetTimer = null;
     }
+    state.activity.clear();
     taskStore.reset();
   };
 }

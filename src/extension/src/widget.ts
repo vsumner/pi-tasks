@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatDuration, primarySavedOutput, runOutputPaths, statusIcon, taskStats } from "./format.ts";
 import type { taskStore } from "./task-store.ts";
-import { isTaskBlocked, readyTasks, type TaskItem, type TaskStatus } from "./task-state.ts";
+import { isTaskBlocked, readyTasks, type TaskActivity, type TaskItem, type TaskStatus } from "./task-state.ts";
 
 export interface TaskWidgetRuntime {
   latestCtx: ExtensionContext | null;
@@ -20,6 +20,8 @@ const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", 
 const DEFAULT_MAX_VISIBLE = 10;
 export const RECENT_COMPLETED_TTL_MS = 30_000;
 export const COMPLETED_ONLY_HIDE_MS = 5_000;
+/** Live activity older than this is considered stale and not rendered. */
+export const STALE_ACTIVITY_MS = 60_000;
 
 // Display priority buckets, lowest rank renders first. Mirrors the Claude
 // task-list order adapted for Pi's richer status model: recent completed is
@@ -84,7 +86,7 @@ function iconFor(task: TaskItem, theme: Theme, frame: number): string {
   return theme.fg("muted", statusIcon(task.status));
 }
 
-function renderTask(task: TaskItem, all: TaskItem[], theme: Theme, frame: number, width: number): string {
+function renderTask(task: TaskItem, all: TaskItem[], theme: Theme, frame: number, width: number, activity?: TaskActivity, nowMs: number = Date.now()): string {
   const icon = iconFor(task, theme, frame);
   const id = theme.fg("dim", `#${task.id}`);
   const title = task.status === "completed"
@@ -112,7 +114,16 @@ function renderTask(task: TaskItem, all: TaskItem[], theme: Theme, frame: number
     ? theme.fg("dim", ` › output saved → ${savedOutputPath}`)
     : latestEvidence ? theme.fg("dim", ` › ${latestEvidence.replace(/\s+/g, " ").slice(0, 80)}`) : "";
 
-  return truncateToWidth(`  ${icon} ${id} ${title}${owner}${stats}${blocked}${proof}`, width);
+  const mainLine = truncateToWidth(`  ${icon} ${id} ${title}${owner}${stats}${blocked}${proof}`, width);
+  // Live activity rollup (swarm-feel): a dim second line under an in_progress
+  // task showing the agent's current tool, mirroring claude-src's per-teammate
+  // summarizeRecentActivities ellipsis line. Only when fresh and not stale.
+  if (task.status === "in_progress" && activity && activity.tool && nowMs - activity.ts <= STALE_ACTIVITY_MS) {
+    const countLabel = activity.count > 0 ? ` · ${activity.count} tool${activity.count === 1 ? "" : "s"}` : "";
+    const activityLine = truncateToWidth(theme.fg("dim", `    ${activity.tool}${countLabel}…`), width);
+    return `${mainLine}\n${activityLine}`;
+  }
+  return mainLine;
 }
 
 const HIDDEN_SUMMARY_ORDER: ReadonlyArray<TaskStatus> = [
@@ -186,19 +197,29 @@ export function planWidget(
   return { sorted, visible: sorted.slice(0, maxVisible), hidden: sorted.slice(maxVisible) };
 }
 
-export function renderLines(tasks: TaskItem[], theme: Theme, frame: number, width: number): string[] {
+export function renderLines(tasks: TaskItem[], theme: Theme, frame: number, width: number, activityByTaskId?: Map<string, TaskActivity>): string[] {
   const plan = planWidget(tasks, Date.now());
   if (!plan) return [];
   const maxW = Math.max(1, width);
-  const readyCount = readyTasks(tasks).length;
+  const nowMs = Date.now();
+  const ready = readyTasks(tasks);
+  const readyCount = ready.length;
   const failedCount = tasks.filter((task) => task.status === "failed").length;
   const headerBits = [taskStats(tasks)];
   if (readyCount) headerBits.push(`${readyCount} ready`);
   if (failedCount) headerBits.push(`${failedCount} failed`);
   const header = truncateToWidth(`${theme.fg("accent", "●")} ${theme.fg("accent", headerBits.join(" · "))}`, maxW);
-  const lines = [header, ...plan.visible.map((task) => renderTask(task, tasks, theme, frame, maxW))];
+  const lines = [header, ...plan.visible.flatMap((task) => renderTask(task, tasks, theme, frame, maxW, activityByTaskId?.get(task.id), nowMs).split("\n"))];
   if (plan.hidden.length > 0) {
     lines.push(truncateToWidth(theme.fg("dim", `    … and ${plan.hidden.length} more (${hiddenSummary(plan.hidden)})`), maxW));
+  }
+  // Mirror claude-src's Spinner "Next: <subject>" footer: when nothing is
+  // in_progress, point at the lowest-ID ready task as the next action. Shown
+  // only while idle so it does not compete with an active spinner.
+  const hasActive = tasks.some((task) => task.status === "in_progress");
+  const next = !hasActive ? ready[0] : undefined;
+  if (next) {
+    lines.push(truncateToWidth(theme.fg("dim", `    Next: ${next.activeForm ?? next.title}`), maxW));
   }
   return lines;
 }
@@ -207,6 +228,7 @@ export function createTaskWidget(
   store: typeof taskStore,
   getRuntime: (ctx: ExtensionContext) => TaskWidgetRuntime,
   storeKey: (ctx: ExtensionContext) => string = (ctx) => ctx.cwd,
+  activityFor?: (scope: string, taskId: string) => TaskActivity | undefined,
 ) {
   function clear(ctx: ExtensionContext, rt: TaskWidgetRuntime): void {
     if (rt.widgetTimer) {
@@ -282,7 +304,17 @@ export function createTaskWidget(
   function makeWidget(ctx: ExtensionContext, rt: TaskWidgetRuntime) {
     return (_tui: unknown, theme: Theme) => ({
       render(width: number): string[] {
-        return renderLines(store.readAll(storeKey(ctx)), theme, rt.widgetFrame, width);
+        const scope = storeKey(ctx);
+        const tasks = store.readAll(scope);
+        // Build the per-task activity map for this scope from the ephemeral
+        // runtime store so renderTask can show the live tool line.
+        const reader = activityFor;
+        const activity = reader ? new Map<string, TaskActivity>() : undefined;
+        if (activity && reader) for (const task of tasks) {
+          const a = reader(scope, task.id);
+          if (a) activity.set(task.id, a);
+        }
+        return renderLines(tasks, theme, rt.widgetFrame, width, activity);
       },
       invalidate() {},
     });
