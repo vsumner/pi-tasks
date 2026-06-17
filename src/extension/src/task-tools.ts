@@ -936,6 +936,11 @@ export function registerTaskTools(
     name: "TaskList",
     label: "TaskList",
     description: "List tasks on the current Pi session branch. Use ready_only to find unblocked pending work.",
+    // Pure read: no mutation, no onTaskChanged, no subagent I/O. Safe to run
+    // in parallel with other tool calls. (TaskStatus/TaskOutput stay
+    // sequential: they call refreshAsyncStatus and fire onTaskChanged/
+    // finishRun on status change, so concurrent calls could double-fire.)
+    executionMode: "parallel",
     promptGuidelines: [
       "Call TaskList after completing a task to find ready follow-up work.",
       "Use ready_only=true to find tasks that are pending and unblocked by unresolved dependencies; check owner before claiming or starting work.",
@@ -959,6 +964,8 @@ export function registerTaskTools(
     name: "TaskGet",
     label: "TaskGet",
     description: "Get full task details, dependencies, evidence, and subagent run metadata.",
+    // Pure read of canonical state by id. Safe to run in parallel.
+    executionMode: "parallel",
     parameters: TaskIdParams,
     async execute(_id, params: TaskIdArgs, _signal, _onUpdate, ctx) {
       const id = taskId(params);

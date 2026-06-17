@@ -271,6 +271,15 @@ export const taskStore = {
     storeVersion += 1;
   },
 
+  /**
+   * Atomicity invariant: the nextId → existence-check → emit sequence is safe
+   * only because this method is fully synchronous. Node's single-threaded event
+   * loop guarantees no other caller can interleave between reading the high
+   * water mark and appending the TASK_CREATED event. If any `await` is ever
+   * added to this path, the check-then-act becomes a TOCTOU race and a lock or
+   * compare-and-set on storeVersion is required (claude-code needed proper-lockfile
+   * for exactly this reason in its multi-process file store).
+   */
   createTask(cwd: string, input: TaskCreateInput): TaskItem {
     if (!input.title.trim()) throw new Error("Task title is required.");
     if (!input.prompt.trim()) throw new Error("Task prompt is required.");
@@ -312,6 +321,14 @@ export const taskStore = {
     return getTaskOrThrow(cwd, taskId);
   },
 
+  /**
+   * Atomicity invariant: evaluateClaim (precondition check) and the subsequent
+   * emit are safe together only because this method is synchronous — the event
+   * loop cannot interleave another claim between the check and the mutation.
+   * If an `await` is inserted, re-evaluate: two callers could both pass the
+   * check and both claim. claude-code guards this with a task-list file lock
+   * because its store is cross-process; pi-tasks' in-memory event model does not.
+   */
   claimTask(cwd: string, taskId: string, options: ClaimTaskOptions): ClaimTaskResult {
     const map = getCwdMap(cwd);
     const task = map.get(taskId) ?? null;
